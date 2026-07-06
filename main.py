@@ -1,5 +1,6 @@
 from scanner import scan_market
 from notifier import send_telegram_message
+import traceback
 
 
 def format_report(results):
@@ -22,9 +23,14 @@ def format_report(results):
 
 
 def main():
-    results = scan_market()
-    report = format_report(results)
-    send_telegram_message(report)
+    try:
+        results = scan_market()
+        report = format_report(results)
+        send_telegram_message(report)
+    except Exception:
+        error_text = traceback.format_exc()
+        print(error_text)
+        send_telegram_message("❌ Bot hata verdi:\n\n" + error_text[-3000:])
 
 
 if __name__ == "__main__":
