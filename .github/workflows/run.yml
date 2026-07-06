@@ -3,7 +3,7 @@ name: Borsa Takip Botu
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"
+      - cron: "00 12 * * 1-5"
 
 jobs:
   run:
