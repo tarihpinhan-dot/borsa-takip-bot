@@ -9,11 +9,9 @@ def send(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# Daha geniş tarama listesi
 stocks = [
     "AAPL","MSFT","TSLA","NVDA","AMZN","META","GOOGL","AMD","NFLX",
-    "INTC","PLTR","SOFI","BABA","TSM","SPY","QQQ","ARKK","DIS","UBER",
-    "SHOP","COIN","MARA","RIOT","LCID","NIO"
+    "PLTR","SOFI","BABA","TSM","SPY","QQQ","DIS","UBER","COIN","MARA","RIOT"
 ]
 
 results = []
@@ -38,39 +36,49 @@ for s in stocks:
         score = 0
 
         # momentum
-        if change > 2:
-            score += 2
-        if change > 4:
-            score += 3
-        if change > 6:
-            score += 4
+        if change > 2: score += 2
+        if change > 4: score += 3
+        if change > 6: score += 4
 
         # trend
-        if trend > 5:
-            score += 3
+        if trend > 5: score += 3
 
-        # volatilite (hareket var mı)
-        if vol > 1:
+        # volatilite (hareket var ama aşırı değil)
+        if 0.8 < vol < 5:
             score += 2
 
-        if score >= 4:
+        # filtre: çok zayıfları ele
+        if score >= 5:
             results.append((s, change, trend, score))
 
     except:
         continue
 
-# sırala
 results.sort(key=lambda x: x[3], reverse=True)
 
-# TOP 3
 if results:
-    msg = "🚀 DAILY AI MARKET RADAR\n\n"
+    msg = "🚀 AI MARKET RADAR (GÜNLÜK)\n\n"
 
     for r in results[:3]:
-        msg += f"{r[0]}\n1D: {r[1]:.2f}% | 5D: {r[2]:.2f}%\nScore: {r[3]}\n\n"
+        symbol = r[0]
+        change = r[1]
+        trend = r[2]
+        score = r[3]
 
-    msg += "🧠 AI: Güçlü momentum ve trend gösteren hisseler\n"
-    msg += "⚠️ Bu bir yatırım tavsiyesi değildir"
+        # basit yorum motoru
+        if score >= 8:
+            label = "🔥 AL (güçlü momentum)"
+        elif score >= 6:
+            label = "👀 İZLE"
+        else:
+            label = "⚠️ ZAYIF"
+
+        msg += f"{symbol}\n"
+        msg += f"1D: {change:.2f}% | 5D: {trend:.2f}%\n"
+        msg += f"Score: {score} → {label}\n\n"
+
+    msg += "🧠 AI: Momentum + trend + volatilite analiz edildi\n"
+    msg += "⚠️ Yatırım tavsiyesi değildir"
 
     send(msg)
 else:
