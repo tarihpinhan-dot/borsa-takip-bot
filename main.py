@@ -9,10 +9,9 @@ def send_message(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": text})
 
-# Takip edilecek bazı büyük hisseler (başlangıç listesi)
 stocks = ["AAPL", "MSFT", "TSLA", "NVDA", "AMZN", "META", "GOOGL"]
 
-messages = []
+results = []
 
 for symbol in stocks:
     data = yf.Ticker(symbol)
@@ -21,21 +20,30 @@ for symbol in stocks:
     if len(hist) < 2:
         continue
 
-    yesterday = hist.iloc[-2]
-    today = hist.iloc[-1]
+    change = ((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2]) * 100
 
-    change = ((today["Close"] - yesterday["Close"]) / yesterday["Close"]) * 100
+    if change > 0:
+        score = 0
 
-    if change >= 2.5:  # momentum filtresi
-        msg = f"""🚀 {symbol}
-Günlük değişim: {change:.2f}%
+        # momentum puanı
+        if change >= 3:
+            score += 2
+        if change >= 5:
+            score += 2
+        if change >= 7:
+            score += 2
 
-📊 Momentum güçlü
-🧠 AI yorum: İlgi artışı olabilir
-"""
-        messages.append(msg)
+        results.append((symbol, change, score))
 
-if messages:
-    send_message("\n\n".join(messages))
+# en güçlüleri sırala
+results.sort(key=lambda x: x[2], reverse=True)
+
+if results:
+    msg = "🚀 BUGÜN EN GÜÇLÜ HİSSELER\n\n"
+
+    for r in results[:5]:
+        msg += f"{r[0]} | +{r[1]:.2f}% | Skor: {r[2]}\n"
+
+    send_message(msg)
 else:
-    send_message("Bugün güçlü momentum yakalanan hisse yok.")
+    send_message("Bugün güçlü momentum yok.")
