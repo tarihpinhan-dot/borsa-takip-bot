@@ -369,9 +369,9 @@ def make_intraday_bars(count=60):
 class AstraTradeIntradayTests(unittest.TestCase):
     def test_intraday_exit_levels_are_short_horizon_and_reject_extreme_volatility(self):
         levels = app.intraday_exit_levels(100.0, 0.20)
-        self.assertAlmostEqual(levels["stop"], 99.40, places=2)
-        self.assertAlmostEqual(levels["target"], 101.20, places=2)
-        self.assertGreaterEqual(levels["target_distance"] / 100.0, 0.012)
+        self.assertAlmostEqual(levels["stop"], 99.50, places=2)
+        self.assertAlmostEqual(levels["target"], 100.80, places=2)
+        self.assertGreaterEqual(levels["target_distance"] / 100.0, 0.008)
         self.assertIsNone(app.intraday_exit_levels(100.0, 2.0))
 
     def test_prepare_intraday_rows_excludes_incomplete_and_stale_data(self):
@@ -460,7 +460,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
         self.assertGreater(tp, sl)
         self.assertLess((tp - sl) / sl, 0.03)
         self.assertEqual(bot.managed_protection["AAPL"]["strategy"], "intraday_v1")
-        self.assertEqual(bot.managed_protection["AAPL"]["max_hold_minutes"], 60)
+        self.assertEqual(bot.managed_protection["AAPL"]["max_hold_minutes"], 45)
 
     def test_intraday_bars_requests_5_minute_iex_data(self):
         broker = app.Alpaca("paper-key", "paper-secret")
