@@ -382,8 +382,16 @@ class Bot:
                 sufficient_history = sum(1 for count in bar_counts.values() if count >= 220)
                 total_daily_bars = sum(bar_counts.values())
                 samples = ", ".join(f"{sym}:{bar_counts[sym]}" for sym in batch[:8])
+                clock = self.broker.clock()
+                market_day = str(clock.get("timestamp", ""))[:10]
                 spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
-                spy = analyze(spy_rows)
+                # During an open session, Alpaca's latest daily candle is incomplete.
+                # Use only completed daily candles for technical indicators and volume confirmation.
+                if clock.get("is_open") and spy_rows and str(spy_rows[-1].get("t", ""))[:10] == market_day:
+                    spy_signal_rows = spy_rows[:-1]
+                else:
+                    spy_signal_rows = spy_rows
+                spy = analyze(spy_signal_rows)
                 market_ok = bool(spy and spy["price"] > spy["sma200"] and spy["ema50"] > spy["sma200"])
                 positions = self.broker.positions()
                 held = {p["symbol"]: p for p in positions}
@@ -396,7 +404,6 @@ class Bot:
                 reserved = set(held) | pending
                 external_positions = set(held) - managed_active
                 account = self.broker.account()
-                clock = self.broker.clock()
                 equity = float(account.get("equity", 0) or 0)
                 cash = float(account.get("cash", 0) or 0)
                 last_equity = float(account.get("last_equity", equity) or equity)
@@ -417,42 +424,63 @@ class Bot:
                 scanned = 0
                 best_score = 0.0
                 buy_signal_count = 0
+                blocked = {"trend": 0, "score": 0, "liquidity": 0, "other": 0}
                 for sym in batch:
                     if self.stop.is_set():
                         break
-                    f = analyze(bars.get(sym, []))
-                    if not f or f["price"] < 5:
+                    raw_rows = bars.get(sym, [])
+                    signal_rows = raw_rows
+                    execution_price = None
+                    if clock.get("is_open") and raw_rows and str(raw_rows[-1].get("t", ""))[:10] == market_day:
+                        # Do not compare partial-session volume with full-day averages.
+                        signal_rows = raw_rows[:-1]
+                        execution_price = float(raw_rows[-1].get("c", 0) or 0)
+                    f = analyze(signal_rows)
+                    if not f:
+                        continue
+                    live_price = execution_price if execution_price and execution_price > 0 else f["price"]
+                    if live_price < 5:
                         continue
                     action = f["action"]
                     best_score = max(best_score, f["score"])
                     if action == "BUY":
                         buy_signal_count += 1
+                    else:
+                        conditions = f["conditions"]
+                        if not (conditions["uzun_trend"] and conditions["trend_sirasi"] and conditions["macd_pozitif"]):
+                            blocked["trend"] += 1
+                        elif f["score"] < 5/6:
+                            blocked["score"] += 1
+                        elif f["dollar_vol"] < 10_000_000:
+                            blocked["liquidity"] += 1
+                        else:
+                            blocked["other"] += 1
                     scanned += 1
-                    self.events.put(("decision", (sym, action, f["score"], f["price"], f["rsi"])))
+                    self.events.put(("decision", (sym, action, f["score"], live_price, f["rsi"])))
                     if not clock.get("is_open") or sym in pending:
                         continue
                     if action == "BUY" and market_ok and risk_allowed and sym not in reserved and len(managed_active) < MAX_MANAGED_POSITIONS:
-                        distance = max(2.0*f["atr"], f["price"]*0.015)
+                        distance = max(2.0*f["atr"], live_price*0.015)
                         if distance <= 0 or distance >= f["price"]*0.25:
                             continue
                         max_risk_dollars = equity * 0.0025
                         managed_room = max(0.0, equity*0.30-managed_exposure)
                         qty_by_risk = int(max_risk_dollars/distance)
-                        qty_by_position = int(equity*0.07/f["price"])
-                        qty_by_exposure = int(managed_room/f["price"])
+                        qty_by_position = int(equity*0.07/live_price)
+                        qty_by_exposure = int(managed_room/live_price)
                         qty_by_cash = int(max(cash, 0)*0.98/f["price"])
                         qty = max(0, min(qty_by_risk, qty_by_position, qty_by_exposure, qty_by_cash))
                         if qty:
-                            stop_price = round(f["price"]-distance, 2)
-                            take_profit_price = round(f["price"]+3.0*distance, 2)
+                            stop_price = round(live_price-distance, 2)
+                            take_profit_price = round(live_price+3.0*distance, 2)
                             result = self.broker.order(sym, qty, "buy", take_profit=take_profit_price, stop_loss=stop_price)
                             pending.add(sym)
                             reserved.add(sym)
                             managed_active.add(sym)
                             self.managed_symbols.add(sym)
                             save_managed_symbols(self.managed_symbols)
-                            managed_exposure += qty*f["price"]
-                            cash = max(0.0, cash-qty*f["price"])
+                            managed_exposure += qty*live_price
+                            cash = max(0.0, cash-qty*live_price)
                             self.events.put(("log", f"ASTRATRADE PAPER ALIŞ {sym} x{qty} | skor {f['score']*100:.0f}/100 | risk USD {qty*distance:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
                     elif action == "SELL" and sym in held and sym in self.managed_symbols:
                         qty = abs(float(held[sym].get("qty", 0) or 0))
@@ -462,7 +490,8 @@ class Bot:
                             self.events.put(("log", f"ASTRATRADE PAPER ÇIKIŞ {sym} x{qty:g} | {result.get('status')}"))
                 self.events.put(("status", (len(symbols), scanned, equity, cash, len(held), bool(clock.get("is_open")), daily_return, len(managed_active))))
                 data_symbols = sum(1 for count in bar_counts.values() if count > 0)
-                self.events.put(("log", f"Tarama kalitesi: {scanned} analiz içinde en yüksek teknik skor {best_score:.2f}/1,00; BUY sinyali {buy_signal_count}. Alış için 6 teknik koşuldan en az 5'i, 10 milyon USD likidite eşiği ve SPY filtresi birlikte aranır." ))
+                self.events.put(("log", f"Tarama kalitesi: {scanned} analiz | en yüksek skor {best_score:.2f}/1,00 | BUY sinyali {buy_signal_count}."))
+                self.events.put(("log", f"BUY engelleri (çakışabilir): ana trend {blocked['trend']}, skor {blocked['score']}, likidite {blocked['liquidity']}, diğer {blocked['other']}. Teknik eşik 6 koşuldan 5'i; 10 milyon USD likidite ve SPY filtresi ayrıca zorunlu."))
                 self.events.put(("log", f"Veri: {data_symbols}/{len(batch)} sembol; {total_daily_bars} günlük bar; 220+ bar geçmişi olan: {sufficient_history}. SPY piyasa filtresi: {'OLUMLU' if market_ok else 'OLUMSUZ'}."))
                 self.events.put(("log", f"Veri örneği: {samples}"))
                 if data_symbols == 0:
