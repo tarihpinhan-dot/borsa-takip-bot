@@ -1287,7 +1287,7 @@ class Bot:
             and spy_signal["ema50"] > spy_signal["sma200"]
         )
         self.events.put(("log", f"Kısa vadeli izleme listesi: {len(scan_symbols)} en likit hisse | günlük ortalama dolar hacmi en az USD 20 milyon."))
-        self.events.put(("log", "Strateji: 5 dakikalık EMA9/21 + VWAP + MACD + Wilder RSI + 12 mum kırılımı + hacim; 15 dakikalık EMA9/21 teyidi; günlük SMA200 rejim filtresi."))
+        self.events.put(("log", "Strateji: 5 dakikalık EMA9/21 + VWAP + MACD + Wilder RSI + 6 mumluk kırılım + hacim; 15 dakikalık EMA9/21 teyidi; günlük SMA200 rejim filtresi."))
         self.events.put(("log", "İşlem planı: hedef %0,80-%2,00; volatiliteye bağlı stop %0,50-%1,00; 45 dakika azami taşıma; 15:45 ET gün sonu kapatma."))
         self.events.put(("log", "Risk motoru: işlem başına azami %0,25 risk bütçesi, pozisyon başına %7, yönetilen toplam maruziyet %30, günlük zarar kilidi %1,5, zirveden düşüş kilidi %5."))
 
