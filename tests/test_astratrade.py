@@ -133,6 +133,17 @@ class AstraTradeCoreTests(unittest.TestCase):
         self.assertEqual([o["id"] for o in broker.orders], ["msft-tp"])
 
 
+    def test_open_orders_paginates_past_500_and_deduplicates_ids(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        first_page = [{"id": f"order-{i}"} for i in range(500)]
+        second_page = [{"id": "order-500"}]
+        with patch.object(broker, "call", side_effect=[first_page, second_page]) as mocked:
+            orders = broker.open_orders()
+        self.assertEqual(len(orders), 501)
+        self.assertEqual(mocked.call_count, 2)
+        second_params = mocked.call_args_list[1].args[2]
+        self.assertEqual(second_params["after_order_id"], "order-499")
+        self.assertEqual(second_params["nested"], "false")
     def test_order_requests_are_bracket_and_recovery_oco(self):
         broker = app.Alpaca("paper-key", "paper-secret")
         with patch.object(broker, "call", return_value={"status": "new"}) as mocked:
