@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'astratrade_gui.py'
+      - 'tests/**'
       - '.github/workflows/astratrade-ai-windows.yml'
 permissions:
   contents: read
@@ -17,6 +18,7 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install --upgrade pip pyinstaller
       - run: python -m py_compile astratrade_gui.py
+      - run: python -m unittest discover -s tests -v
       - run: pyinstaller --noconfirm --clean --onefile --windowed --name AstraTradeAI astratrade_gui.py
       - uses: actions/upload-artifact@v4
         with:
