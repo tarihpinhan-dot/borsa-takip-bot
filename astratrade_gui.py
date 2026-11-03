@@ -556,7 +556,7 @@ def analyze_intraday(rows, daily_signal):
         ) / volume_sum
         if volume_sum > 0 else price
     )
-    previous_high = max(h[-13:-1])
+    previous_high = max(h[-7:-1])
     fifteen = aggregate_15m(rows)
     if len(fifteen) < 12:
         return None
@@ -568,10 +568,10 @@ def analyze_intraday(rows, daily_signal):
         "5m_trend": ema9 > ema21,
         "15m_trend": ema9_15 > ema21_15,
         "macd_positive": macd_hist > 0,
-        "rsi_window": 50 <= rsi <= 70,
+        "rsi_window": 48 <= rsi <= 72,
         "above_vwap": price > vwap,
         "12_bar_breakout": price > previous_high,
-        "relative_volume": relative_volume >= 1.15
+        "relative_volume": relative_volume >= 1.00
     }
     score = sum(bool(value) for value in conditions.values()) / len(conditions)
     daily_uptrend = (
@@ -580,7 +580,7 @@ def analyze_intraday(rows, daily_signal):
     )
     liquid = float(daily_signal.get("dollar_vol", 0)) >= 25_000_000
     hard_gates = conditions["5m_trend"] and conditions["15m_trend"] and conditions["above_vwap"]
-    action = "BUY" if daily_uptrend and liquid and hard_gates and score >= 5/7 else (
+    action = "BUY" if daily_uptrend and liquid and hard_gates and score >= 4/7 else (
         "SELL" if price < ema21 and price < vwap and macd_hist < 0 else "HOLD"
     )
     return {
@@ -594,16 +594,16 @@ def analyze_intraday(rows, daily_signal):
 
 
 def intraday_exit_levels(price, atr):
-    """Return a 0.60%-1.20% volatility-aware stop and at least 1.20% target."""
+    """Short-horizon volatility-aware bracket: 0.50%-1.00% stop, >=0.80% target, >=1.6R."""
     price = float(price)
     atr = float(atr)
     if price <= 0 or atr <= 0:
         return None
-    stop_distance = max(1.2 * atr, price * 0.006)
-    if stop_distance > price * 0.012:
+    stop_distance = max(1.0 * atr, price * 0.005)
+    if stop_distance > price * 0.010:
         return None
-    target_distance = max(price * 0.012, stop_distance * 1.6)
-    if target_distance > price * 0.025:
+    target_distance = max(price * 0.008, stop_distance * 1.6)
+    if target_distance > price * 0.020:
         return None
     stop = round(price - stop_distance, 2)
     target = round(price + target_distance, 2)
@@ -796,7 +796,7 @@ def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starti
             elif bar_high >= position["target"]:
                 exit_price = position["target"] * (1 - slippage)
                 reason = "HEDEF"
-            elif i - position["entry_index"] >= 12 or (local.hour * 60 + local.minute) >= 945:
+            elif i - position["entry_index"] >= 9 or (local.hour * 60 + local.minute) >= 945:
                 exit_price = bar_close * (1 - slippage)
                 reason = "ZAMAN/GÜN SONU"
             elif signal and signal["action"] == "SELL":
@@ -1288,7 +1288,7 @@ class Bot:
         )
         self.events.put(("log", f"Kısa vadeli izleme listesi: {len(scan_symbols)} en likit hisse | günlük ortalama dolar hacmi en az USD 20 milyon."))
         self.events.put(("log", "Strateji: 5 dakikalık EMA9/21 + VWAP + MACD + Wilder RSI + 12 mum kırılımı + hacim; 15 dakikalık EMA9/21 teyidi; günlük SMA200 rejim filtresi."))
-        self.events.put(("log", "İşlem planı: hedef en az %1,20; volatiliteye bağlı stop %0,60-%1,20; 60 dakika azami taşıma; 15:45 ET gün sonu kapatma."))
+        self.events.put(("log", "İşlem planı: hedef en az %1,20; volatiliteye bağlı stop %0,60-%1,20; 45 dakika azami taşıma; 15:45 ET gün sonu kapatma."))
         self.events.put(("log", "Risk motoru: işlem başına azami %0,25 risk bütçesi, pozisyon başına %7, yönetilen toplam maruziyet %30, günlük zarar kilidi %1,5, zirveden düşüş kilidi %5."))
 
         while not self.stop.is_set():
@@ -1351,7 +1351,7 @@ class Bot:
                         elapsed_minutes = (now_utc - _parse_utc(opened_at)).total_seconds() / 60
                     except (TypeError, ValueError):
                         elapsed_minutes = 0
-                    max_hold = float(meta.get("max_hold_minutes", 60) or 60)
+                    max_hold = float(meta.get("max_hold_minutes", 45) or 60)
                     if elapsed_minutes >= max_hold or force_flat_time:
                         self.events.put(("log", f"ZAMAN ÇIKIŞI {symbol}: taşıma {elapsed_minutes:.0f} dk; pozisyon kapatılıyor."))
                         if self._close_managed_position(symbol, open_orders):
@@ -1455,7 +1455,7 @@ class Bot:
                                 "qty": qty,
                                 "strategy": "intraday_v1",
                                 "opened_at": now_utc.isoformat(),
-                                "max_hold_minutes": 60,
+                                "max_hold_minutes": 45,
                                 "entry_price": live_price
                             }
                             self._save_management_state()
@@ -1467,7 +1467,7 @@ class Bot:
                             available_cash = max(0.0, available_cash - qty * live_price)
                             self.events.put((
                                 "log",
-                                f"ASTRATRADE PAPER KISA VADE ALIŞ {symbol} x{qty} | skor {signal['score']*100:.0f}/100 | giriş USD {live_price:.2f} | SL {levels['stop']:.2f} ({levels['stop_distance']/live_price*100:.2f}%) | TP {levels['target']:.2f} ({levels['target_distance']/live_price*100:.2f}%) | azami taşıma 60 dk | {result.get('status')}"
+                                f"ASTRATRADE PAPER KISA VADE ALIŞ {symbol} x{qty} | skor {signal['score']*100:.0f}/100 | giriş USD {live_price:.2f} | SL {levels['stop']:.2f} ({levels['stop_distance']/live_price*100:.2f}%) | TP {levels['target']:.2f} ({levels['target_distance']/live_price*100:.2f}%) | azami taşıma 45 dk | {result.get('status')}"
                             ))
                     elif signal["action"] == "SELL" and symbol in held and symbol in self.managed_symbols:
                         meta = self.managed_protection.get(symbol, {})
