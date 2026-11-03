@@ -119,6 +119,10 @@ def logline(msg):
         pass
     return line
 
+class RetryableDataRequestError(RuntimeError):
+    """A retryable market-data request exhausted its safe GET retries."""
+
+
 class Alpaca:
     def __init__(self, key, secret):
         if not key or not secret: raise ValueError("Paper API Key ve Secret Key gerekli.")
@@ -141,6 +145,87 @@ class Alpaca:
             raise RuntimeError(f"Alpaca HTTP {exc.code} ({method} {path}): {detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"Alpaca bağlantı hatası ({path}): {exc.reason}") from exc
+    def data_call_with_retry(self, path, params=None, description="piyasa verisi", progress_callback=None, attempts=3):
+        """Retry only idempotent market-data GET requests; never retry order mutations."""
+        retry_markers = (
+            "alpaca bağlantı hatası", "timed out", "timeout",
+            "connection reset", "connection aborted", "remote end closed",
+            "temporarily unavailable", "temporary failure",
+            "http 429", "http 500", "http 502", "http 503", "http 504"
+        )
+        for attempt in range(attempts):
+            try:
+                return self.call(DATA, path, params)
+            except Exception as exc:
+                message = str(exc).lower()
+                retryable = isinstance(exc, (TimeoutError, OSError)) or any(
+                    marker in message for marker in retry_markers
+                )
+                if not retryable:
+                    raise
+                if attempt + 1 >= attempts:
+                    raise RetryableDataRequestError(
+                        f"{description}: {attempts} denemede veri alınamadı: {exc}"
+                    ) from exc
+                delay = 1.0 * (2 ** attempt)
+                notice = (
+                    f"{description}: geçici bağlantı/zaman aşımı; "
+                    f"{attempt + 1}/{attempts - 1} yeniden deneme {delay:.0f} sn sonra."
+                )
+                logline(notice)
+                if progress_callback:
+                    progress_callback(notice)
+                time.sleep(delay)
+
+    def _fetch_bars_chunk(self, symbols, params, max_pages, description, progress_callback=None):
+        """Fetch one symbol group atomically; split slow groups down to five symbols."""
+        chunk_data = {}
+        page_params = dict(params)
+        try:
+            for page_number in range(max_pages):
+                page = self.data_call_with_retry(
+                    "/v2/stocks/bars", page_params, description, progress_callback
+                )
+                for symbol, rows in page.get("bars", {}).items():
+                    chunk_data.setdefault(symbol, []).extend(rows)
+                token = page.get("next_page_token")
+                if not token:
+                    break
+                page_params = dict(params, page_token=token)
+            else:
+                raise RuntimeError(
+                    f"{description}: sayfalama {max_pages} istekte tamamlanmadı."
+                )
+            return chunk_data, set()
+        except RetryableDataRequestError as exc:
+            if len(symbols) <= 5:
+                failed = set(symbols)
+                notice = (
+                    f"{description}: {', '.join(symbols)} için veri alınamadı; "
+                    "bu semboller yeni alım taramasının dışında bırakılıyor."
+                )
+                logline(notice)
+                if progress_callback:
+                    progress_callback(notice)
+                return {}, failed
+            midpoint = len(symbols) // 2
+            notice = (
+                f"{description}: {len(symbols)} sembollük grup zaman aşımına uğradı; "
+                f"{midpoint} + {len(symbols) - midpoint} sembollük iki gruba ayrılıyor."
+            )
+            logline(notice)
+            if progress_callback:
+                progress_callback(notice)
+            left_data, left_failed = self._fetch_bars_chunk(
+                symbols[:midpoint], params, max_pages, description, progress_callback
+            )
+            right_data, right_failed = self._fetch_bars_chunk(
+                symbols[midpoint:], params, max_pages, description, progress_callback
+            )
+            for symbol, rows in right_data.items():
+                left_data.setdefault(symbol, []).extend(rows)
+            return left_data, left_failed | right_failed
+
     def account(self): return self.call(PAPER, "/v2/account")
     def assets(self): return self.call(PAPER, "/v2/assets", {"status":"active","asset_class":"us_equity"})
     def positions(self): return self.call(PAPER, "/v2/positions")
@@ -175,12 +260,13 @@ class Alpaca:
         else:
             raise RuntimeError("Alpaca emir sayfalaması beklenmeyen şekilde sonlandı; güvenlik için işlem taraması durduruldu.")
         return orders
-    def bars(self, symbols):
-        # Alpaca's limit is shared across all symbols in a request and results are
-        # ordered by symbol. Keep each request small enough to fit one year of daily
-        # bars for every symbol, then still follow any unexpected page token.
+    def bars(self, symbols, progress_callback=None):
+        """Fetch one year of daily IEX bars in resilient, restart-safe GET batches."""
         collected = {}
-        for offset in range(0, len(symbols), 20):
+        failed_symbols = set()
+        total = len(symbols)
+        completed = 0
+        for offset in range(0, total, 20):
             chunk = symbols[offset:offset + 20]
             params = {
                 "symbols": ",".join(chunk),
@@ -192,19 +278,25 @@ class Alpaca:
                 "end": datetime.now(timezone.utc).isoformat(),
                 "sort": "asc"
             }
-            for _ in range(5):
-                page = self.call(DATA, "/v2/stocks/bars", params)
-                for symbol, rows in page.get("bars", {}).items():
-                    collected.setdefault(symbol, []).extend(rows)
-                token = page.get("next_page_token")
-                if not token:
-                    break
-                params["page_token"] = token
-        return {"bars": collected}
+            chunk_data, chunk_failed = self._fetch_bars_chunk(
+                chunk, params, max_pages=5,
+                description="Günlük hisse verisi", progress_callback=progress_callback
+            )
+            for symbol, rows in chunk_data.items():
+                collected.setdefault(symbol, []).extend(rows)
+            failed_symbols.update(chunk_failed)
+            completed += len(chunk)
+            if progress_callback and (completed % 100 == 0 or completed == total):
+                progress_callback(
+                    f"Günlük veri indirme: {completed}/{total} sembol tamamlandı; "
+                    f"verisi alınamayan {len(failed_symbols)} sembol."
+                )
+        return {"bars": collected, "failed_symbols": sorted(failed_symbols)}
 
     def intraday_bars(self, symbols, days=5):
-        """Fetch recent 5-minute IEX bars in safe 20-symbol chunks."""
+        """Fetch recent 5-minute IEX bars in safe, retryable 20-symbol chunks."""
         collected = {}
+        failed_symbols = set()
         for offset in range(0, len(symbols), 20):
             chunk = symbols[offset:offset + 20]
             params = {
@@ -217,17 +309,13 @@ class Alpaca:
                 "end": datetime.now(timezone.utc).isoformat(),
                 "sort": "asc"
             }
-            for page_number in range(10):
-                page = self.call(DATA, "/v2/stocks/bars", params)
-                for symbol, rows in page.get("bars", {}).items():
-                    collected.setdefault(symbol, []).extend(rows)
-                token = page.get("next_page_token")
-                if not token:
-                    break
-                params["page_token"] = token
-            else:
-                raise RuntimeError("5 dakikalık veri sayfalaması 10 sayfada tamamlanmadı; tarama güvenlik için durduruldu.")
-        return {"bars": collected}
+            chunk_data, chunk_failed = self._fetch_bars_chunk(
+                chunk, params, max_pages=10, description="5 dakikalık hisse verisi"
+            )
+            for symbol, rows in chunk_data.items():
+                collected.setdefault(symbol, []).extend(rows)
+            failed_symbols.update(chunk_failed)
+        return {"bars": collected, "failed_symbols": sorted(failed_symbols)}
 
     def history(self, symbol, timeframe="1Day", days=365, adjustment="raw"):
         params = {
@@ -241,7 +329,7 @@ class Alpaca:
         }
         rows = []
         for _ in range(5):
-            page = self.call(DATA, "/v2/stocks/" + urllib.parse.quote(symbol.upper()) + "/bars", params)
+            page = self.data_call_with_retry("/v2/stocks/" + urllib.parse.quote(symbol.upper()) + "/bars", params, f"{symbol} tarihsel veri")
             rows.extend(page.get("bars", []))
             token = page.get("next_page_token")
             if not token:
@@ -1307,7 +1395,19 @@ class Bot:
         startup_clock = self.broker.clock()
         market_day = str(startup_clock.get("timestamp", ""))[:10]
         self.events.put(("log", f"ABD adi hisse evreni: {len(symbols)} sembol; likidite sıralaması hazırlanıyor."))
-        daily_data = self.broker.bars(symbols).get("bars", {})
+        daily_result = self.broker.bars(
+            symbols,
+            progress_callback=lambda message: self.events.put(("log", message))
+        )
+        daily_data = daily_result.get("bars", {})
+        failed_daily_symbols = daily_result.get("failed_symbols", [])
+        if failed_daily_symbols:
+            self.events.put(("log", f"Günlük verisi alınamayan {len(failed_daily_symbols)} sembol yeni alım adaylarından çıkarıldı."))
+        if len(failed_daily_symbols) > max(25, int(len(symbols) * 0.02)):
+            raise RuntimeError(
+                f"Günlük veri kaybı yüksek ({len(failed_daily_symbols)}/{len(symbols)} sembol); "
+                "eksik evrenle işlem yapılmaması için bot durduruldu."
+            )
         daily_signals = {}
         for symbol in symbols:
             completed, _, _ = prepare_daily_signal_rows(
@@ -1631,7 +1731,7 @@ class App:
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
         tk.Label(settings,text="STRATEJİ: Kısa vadeli gün içi işlem. 5 dakikalık EMA9/21, VWAP, MACD, Wilder RSI, 6 mumluk (30 dk) kırılım ve hacim; 15 dakikalık EMA9/21 yön teyidi; günlük SMA200 ve SPY piyasa rejimi filtresi. İzleme listesi günlük ortalama en az 20 milyon USD dolar hacmine sahip en likit 300 adi hisseden oluşturulur. Sistem makine öğrenmesi değildir; kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
         tk.Label(settings,text="Yeni pozisyonlar ayarlardaki dolar kâr hedefinde (varsayılan USD 20) kapatılır; hedef/stop oranı en az 1,6 korunacak şekilde adet hesaplanır. Hedef fiyatın girişten %2’den uzakta kalması gerekiyorsa işlem alınmaz. Volatiliteye göre stop %0,50-%1,00 aralığındadır. Azami pozisyon süresi 45 dakika, gün sonu kapatma saati 15:45 ET; yeni alış penceresi 09:45-15:00 ET. İşlem başına risk bütçesi %0,25, tek pozisyon %7, toplam yönetilen maruziyet %30. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alış kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlara ve önceden açılmış ADSK gibi eski strateji pozisyonlarına otomatik müdahale edilmez.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
-        tk.Label(settings,text="Piyasa verisi ücretsiz IEX akışıdır; tüm ABD borsalarının işlem hacmini kapsamaz. 2.518 sembollük evrenden günlük likiditeye göre en üst 300 hisse seçilir ve her 5 dakikada tamamı yeniden taranır. Sadece aktif NYSE/NASDAQ/NYSE American adi hisseleri kullanılır; ETF ve diğer fonlar dışarıda bırakılır. Önceden açılmış pozisyonların koruma emirleri değiştirilmez. Gerçek para hesabı desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Piyasa verisi ücretsiz IEX akışıdır; tüm ABD borsalarının işlem hacmini kapsamaz. 2.518 sembollük evrenden günlük likiditeye göre en üst 300 hisse seçilir ve her 5 dakikada tamamı yeniden taranır. Veri indirme zaman aşımında güvenli GET tekrarları ve büyük grupları küçültme uygulanır; sınırlı sayıda verisi alınamayan sembol tarama dışına çıkarılır, veri kaybı yüksekse bot işlem yapmadan durur. Sadece aktif NYSE/NASDAQ/NYSE American adi hisseleri kullanılır; ETF ve diğer fonlar dışarıda bırakılır. Önceden açılmış pozisyonların koruma emirleri değiştirilmez. Gerçek para hesabı desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         # Midas benzeri mum grafiği: fiyat, EMA20/50 ve hacim.
         chart_controls=tk.Frame(chart,bg=bg,padx=15,pady=12); chart_controls.pack(fill="x")
         tk.Label(chart_controls,text="Hisse kodu",bg=bg,fg="white").pack(side="left")
