@@ -276,7 +276,7 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
         if position:
             # Conservative same-day ambiguity: assume stop is hit before target.
             if day_low <= position["stop"]:
-                exit_price = position["stop"] * (1-slippage)
+                exit_price = min(day_open, position["stop"]) * (1-slippage)
                 exit_reason = "STOP"
             elif day_high >= position["target"]:
                 exit_price = position["target"] * (1-slippage)
@@ -323,11 +323,14 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
     first = float(rows[220]["c"])
     last = float(rows[-1]["c"])
     benchmark = ((last/first)-1)*100 if first else 0.0
+    spy_first = float(spy_rows[220]["c"])
+    spy_last = float(spy_rows[-1]["c"])
+    spy_benchmark = ((spy_last/spy_first)-1)*100 if spy_first else 0.0
     return {
         "initial":starting_equity,"final":equity,"return_pct":(equity/starting_equity-1)*100,
         "trades":len(trades),"win_rate":(len(wins)/len(trades)*100) if trades else 0.0,
         "profit_factor":profit_factor,"max_drawdown":max_dd*100,
-        "benchmark":benchmark,"avg_trade":(sum(x["pnl"] for x in trades)/len(trades)) if trades else 0.0,
+        "benchmark":benchmark,"spy_benchmark":spy_benchmark,"avg_trade":(sum(x["pnl"] for x in trades)/len(trades)) if trades else 0.0,
         "trades_detail":trades
     }
 
@@ -486,8 +489,8 @@ class App:
         tk.Label(head,text="US EQUITIES • PAPER ONLY • RULE-BASED",bg=bg,fg=green).pack(side="left",padx=15)
         self.connection=tk.Label(head,text="● BAĞLI DEĞİL",bg=bg,fg="#ffc36d"); self.connection.pack(side="right")
         tabs=ttk.Notebook(self.root); tabs.pack(fill="both",expand=True,padx=20,pady=(0,15)); self.tabs=tabs
-        home=tk.Frame(tabs,bg=bg); settings=tk.Frame(tabs,bg=bg); history=tk.Frame(tabs,bg=bg); chart=tk.Frame(tabs,bg=bg); backtest=tk.Frame(tabs,bg=bg)
-        tabs.add(home,text="Genel Bakış"); tabs.add(chart,text="Piyasa Grafiği"); tabs.add(backtest,text="Strateji Testi"); tabs.add(history,text="Emirler"); tabs.add(settings,text="Bağlantı ve Risk"); self.settings=settings
+        home=tk.Frame(tabs,bg=bg); settings=tk.Frame(tabs,bg=bg); history=tk.Frame(tabs,bg=bg); chart=tk.Frame(tabs,bg=bg); backtest=tk.Frame(tabs,bg=bg); portfolio=tk.Frame(tabs,bg=bg)
+        tabs.add(home,text="Genel Bakış"); tabs.add(portfolio,text="Portföy"); tabs.add(chart,text="Piyasa Grafiği"); tabs.add(backtest,text="Strateji Testi"); tabs.add(history,text="Emirler"); tabs.add(settings,text="Bağlantı ve Risk"); self.settings=settings
         self.chart_page=chart
         self.metrics={}
         row=tk.Frame(home,bg=bg); row.pack(fill="x",pady=15)
@@ -526,6 +529,15 @@ class App:
         self.price_canvas=tk.Canvas(chart,bg="#0b1220",highlightthickness=0); self.price_canvas.pack(fill="both",expand=True,padx=12,pady=12)
         self.price_canvas.bind("<Configure>",lambda e:self.draw_price_chart())
         self.chart_rows=[]; self.chart_name=""; self.chart_timeframe="1Day"
+        posbar=tk.Frame(portfolio,bg=bg,padx=15,pady=12); posbar.pack(fill="x")
+        tk.Label(posbar,text="Hesaptaki bütün açık pozisyonlar • gerçekleşmemiş K/Z",bg=bg,fg="#9caec1").pack(side="left")
+        tk.Button(posbar,text="POZİSYONLARI YENİLE",command=self.refresh_positions,bg=green,fg="#07131a",relief="flat",padx=14,pady=7).pack(side="right")
+        self.position_tree=ttk.Treeview(portfolio,columns=("symbol","qty","avg","last","value","pnl","pnlpc"),show="headings")
+        for col,title,width in [("symbol","HİSSE",90),("qty","ADET",90),("avg","ORT. MALİYET",130),("last","GÜNCEL FİYAT",130),("value","PİYASA DEĞERİ",150),("pnl","GERÇEKLEŞMEMİŞ K/Z",170),("pnlpc","K/Z %",100)]:
+            self.position_tree.heading(col,text=title); self.position_tree.column(col,width=width,anchor="center")
+        self.position_tree.tag_configure("profit",foreground="#36c99a")
+        self.position_tree.tag_configure("loss",foreground="#ef6b73")
+        self.position_tree.pack(fill="both",expand=True,padx=15,pady=15)
         btbar=tk.Frame(backtest,bg=bg,padx=18,pady=18); btbar.pack(fill="x")
         tk.Label(btbar,text="ABD hisse kodu",bg=bg,fg="white").pack(side="left")
         self.backtest_symbol=tk.Entry(btbar,width=12,font=("Segoe UI",11)); self.backtest_symbol.insert(0,"AAPL"); self.backtest_symbol.pack(side="left",padx=8)
@@ -538,6 +550,17 @@ class App:
             self.tree.heading(col,text=title); self.tree.column(col,width=width,anchor="center")
         self.tree.pack(fill="both",expand=True,padx=15,pady=15)
         tk.Button(history,text="İŞLEMLERİ YENİLE",command=self.refresh_history).pack(anchor="e",padx=15,pady=10)
+    def refresh_positions(self):
+        if not self.broker:
+            messagebox.showinfo("Bağlantı","Önce Alpaca Paper bağlantısını test et.")
+            return
+        def work():
+            try:
+                self.events.put(("positions",self.broker.positions()))
+            except Exception as exc:
+                self.events.put(("log","Pozisyonlar alınamadı: "+str(exc)))
+        threading.Thread(target=work,daemon=True).start()
+
     def run_backtest(self):
         if not self.broker:
             messagebox.showinfo("Bağlantı","Önce Alpaca Paper bağlantısını test et.")
@@ -685,8 +708,6 @@ class App:
             self.tabs.select(self.settings); messagebox.showwarning("Bağlantı","Önce Paper API bilgilerini gir."); return
         if self.thread and self.thread.is_alive(): return
         self.broker=Alpaca(self.key.get().strip(),self.secret.get().strip())
-        try: save_credentials(self.key.get().strip(),self.secret.get().strip())
-        except Exception as exc: self.add_log("API bilgileri kaydedilemedi: "+str(exc))
         self.stop_event.clear()
         bot=Bot(self.broker,self.events,self.stop_event); self.thread=threading.Thread(target=self.run,args=(bot,),daemon=True); self.thread.start()
         self.start_button.configure(state="disabled"); self.stop_button.configure(state="normal"); self.connection.configure(text="● BOT ÇALIŞIYOR",fg="#36c99a")
