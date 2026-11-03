@@ -4,7 +4,8 @@ from tkinter import ttk, messagebox
 
 PAPER = "https://paper-api.alpaca.markets"
 DATA = "https://data.alpaca.markets"
-EXCHANGES = {"NYSE", "NASDAQ", "AMEX", "ARCA", "NYSEARCA", "BATS"}
+EXCHANGES = {"NYSE", "NASDAQ", "AMEX"}
+EXCLUDED_NAME_TERMS = (" etf", "fund", "warrant", "unit", "right", "preferred", "depositary", "depositary share", "notes", "bond")
 POS = {"beats","beat","surge","record","upgrade","growth","profit","strong","buyback","raises","approval","approved","bullish","wins","revenue"}
 NEG = {"miss","downgrade","plunge","loss","warning","warns","cuts","fraud","probe","investigation","lawsuit","recall","bankruptcy","bearish","weak","layoff"}
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "AstraTradeAI")
@@ -100,7 +101,7 @@ def analyze(rows):
     if ret20>0: score+=.10
     score+=.10*(1 if macd>0 and ret20>0 else .5)
     action="BUY" if score>=.75 else ("SELL" if price<e20 and macd<0 else "HOLD")
-    return {"price":price,"ema20":e20,"ema50":e50,"macd":macd,"rsi":rsi,"atr":atr,"score":score,"action":action}
+    return {"price":price,"ema20":e20,"ema50":e50,"macd":macd,"rsi":rsi,"atr":atr,"dollar_vol":dollar_vol,"score":score,"action":action}
 
 def news_score(items):
     scores={}
@@ -115,8 +116,21 @@ class Bot:
     def run(self):
         self.broker.account()
         assets=self.broker.assets()
-        symbols=sorted({a["symbol"] for a in assets if a.get("tradable") and str(a.get("status","")).lower().endswith("active") and str(a.get("exchange","")).upper() in EXCHANGES})
-        if not symbols: raise RuntimeError("Alpaca uygun ABD hissesi listesi döndürmedi.")
+        eligible=set()
+        for asset in assets:
+            name=str(asset.get("name","")).lower()
+            exchange=str(asset.get("exchange","")).upper()
+            symbol=str(asset.get("symbol","")).strip()
+            is_common_stock=("common stock" in name or "common shares" in name)
+            excluded=any(term in name for term in EXCLUDED_NAME_TERMS)
+            if (symbol and asset.get("tradable")
+                and str(asset.get("status","")).lower()=="active"
+                and exchange in EXCHANGES and is_common_stock and not excluded):
+                eligible.add(symbol)
+        symbols=sorted(eligible)
+        excluded_count=max(0,len(assets)-len(symbols))
+        if not symbols: raise RuntimeError("Alpaca'dan adi hisse olarak tanımlanabilen uygun ABD hissesi gelmedi.")
+        self.events.put(("log",f"Varlık filtresi: adi hisse adı eşleşen {len(symbols)} sembol tutuldu; fon/ETF ve diğer uygun olmayan varlıklar dışarıda bırakıldı (ham liste: {len(assets)})."))
         batch_size=200
         scan_interval=300
         self.events.put(("log",f"Bağlantı başarılı. Uygun hisse evreni: {len(symbols)}. Her turda {batch_size} hisse taranır; tur aralığı 5 dakika."))
@@ -151,6 +165,8 @@ class Bot:
                     sentiment=sentiments.get(sym,0.0)
                     score=max(0,min(1,f["score"]+.05*sentiment))
                     action="BUY" if score>=.75 else ("SELL" if f["action"]=="SELL" else "HOLD")
+                    if action=="BUY" and f["dollar_vol"] < 5_000_000:
+                        action="HOLD"
                     scanned+=1
                     self.events.put(("decision",(sym,action,score,f["price"],f["rsi"])))
                     if not clock.get("is_open") or sym in pending: continue
@@ -222,7 +238,7 @@ class App:
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
         tk.Label(settings,text="Strateji: EMA / RSI / MACD ve basit haber kelime puanlaması; bu sürüm makine öğrenmesi modeli değildir.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
         tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz. Açık pozisyonlar ve bekleyen alış emirleri birlikte en fazla 5 ile sınırlandırılır; işlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
-        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Son 1 yıllık günlük veriler 20'şer sembollük isteklerle alınır; böylece Alpaca'nın 10.000 toplam bar sınırı aşılmaz. Her 5 dakikada 200 sembol taranır. Veri sayıları faaliyet kayıtlarına yazılır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Tarama evreni yalnızca adı Common Stock / Common Shares olan aktif NYSE, NASDAQ ve NYSE American adi hisseleridir. ETF, kaldıraçlı/ters fon, varant, imtiyazlı pay, birim ve tahvil benzeri varlıklar dışarıda bırakılır. Alış için ayrıca 20 günlük ortalama günlük dolar hacmi en az 5 milyon USD olmalıdır. Her 5 dakikada 200 sembol taranır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
         for col,title,width in [("time","ZAMAN",180),("symbol","HİSSE",100),("side","YÖN",100),("qty","ADET",100),("status","DURUM",180)]:
             self.tree.heading(col,text=title); self.tree.column(col,width=width,anchor="center")
