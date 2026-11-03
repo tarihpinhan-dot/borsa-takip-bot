@@ -374,6 +374,17 @@ class AstraTradeIntradayTests(unittest.TestCase):
         self.assertAlmostEqual(levels["target_distance"] / 100.0, 0.008, places=6)
         self.assertIsNone(app.intraday_exit_levels(100.0, 2.0))
 
+    def test_intraday_reward_risk_survives_cent_rounding(self):
+        for price, atr in ((50.23, 0.15), (100.10, 0.60), (250.00, 1.00)):
+            levels = app.intraday_exit_levels(price, atr)
+            self.assertIsNotNone(levels)
+            self.assertGreaterEqual(
+                levels["target_distance"] + 0.011,
+                levels["stop_distance"] * 1.6
+            )
+            self.assertLessEqual(levels["stop_distance"], price * 0.010 + 0.005)
+            self.assertGreaterEqual(levels["stop_distance"], price * 0.005 - 0.005)
+
     def test_prepare_intraday_rows_excludes_incomplete_and_stale_data(self):
         rows = make_intraday_bars(60)
         last = datetime.fromisoformat(rows[-1]["t"].replace("Z", "+00:00"))
