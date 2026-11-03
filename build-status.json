@@ -1,9 +1,9 @@
 {
   "status": "success",
-  "workflow_run_id": "41705511572",
+  "workflow_run_id": "41710763954",
   "run_attempt": "1",
-  "source_commit": "55edc5e73b2f35c2b7940e41fcf91be6f6e821f8",
-  "branch": "main",
+  "source_commit": "82e9b223111b11f9f52ba7a6eb3d0f40b042d480",
+  "branch": "fix/alpaca-data-timeout-retries",
   "artifact_name": "AstraTradeAI-Windows",
-  "recorded_at_utc": "2026-11-03T19:41:58.4554523Z"
+  "recorded_at_utc": "2026-11-03T20:15:42.5949952Z"
 }
