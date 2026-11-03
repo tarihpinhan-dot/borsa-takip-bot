@@ -462,31 +462,155 @@ class Bot:
         self.events = events
         self.stop = stop
         self.managed_symbols = load_managed_symbols()
+        self.managed_groups = load_managed_groups()
+        self.managed_protection = load_managed_protection()
+
+    def _save_management_state(self):
+        save_managed_symbols(self.managed_symbols)
+        save_managed_groups(self.managed_groups)
+        save_managed_protection(self.managed_protection)
+
+    def _close_managed_position(self, symbol, open_orders):
+        """Cancel only this AstraTrade position's OCO legs, then close it at market."""
+        position = next((p for p in self.broker.positions() if p.get("symbol") == symbol), None)
+        if not position:
+            self.managed_symbols.discard(symbol)
+            self.managed_groups.pop(symbol, None)
+            self.managed_protection.pop(symbol, None)
+            self._save_management_state()
+            self.events.put(("log", f"{symbol}: pozisyon zaten kapanmış; takip kaydı temizlendi."))
+            return True
+
+        sell_orders = [
+            o for o in open_orders
+            if o.get("symbol") == symbol and str(o.get("side", "")).lower() == "sell"
+        ]
+        group_id = self.managed_groups.get(symbol)
+        candidate_groups = {
+            str(o.get("group_id"))
+            for o in sell_orders
+            if o.get("group_id") and o.get("group_role") in ("take_profit", "stop_loss")
+        }
+        if not group_id and len(candidate_groups) == 1:
+            group_id = next(iter(candidate_groups))
+            self.managed_groups[symbol] = group_id
+            self._save_management_state()
+        if len(candidate_groups) > 1:
+            self.events.put(("log", f"ÇIKIŞ GÜVENLİK ENGELİ {symbol}: birden fazla emir grubu var; otomatik satış yapılmadı."))
+            return False
+        if group_id and candidate_groups and group_id not in candidate_groups:
+            self.events.put(("log", f"ÇIKIŞ GÜVENLİK ENGELİ {symbol}: kayıtlı emir grubu ile Alpaca emirleri uyuşmuyor."))
+            return False
+
+        protection = self.managed_protection.get(symbol, {})
+        take_profit = float(protection.get("take_profit", 0) or 0)
+        stop_loss = float(protection.get("stop_loss", 0) or 0)
+        for order in sell_orders:
+            if group_id and str(order.get("group_id") or "") == str(group_id):
+                if order.get("group_role") == "take_profit":
+                    take_profit = float(order.get("limit_price") or take_profit or 0)
+                elif order.get("group_role") == "stop_loss":
+                    stop_loss = float(order.get("stop_price") or stop_loss or 0)
+
+        unrelated_sells = [
+            o for o in sell_orders
+            if not group_id or str(o.get("group_id") or "") != str(group_id)
+        ]
+        # A standalone/manual sell order is never canceled by AstraTrade.
+        if unrelated_sells:
+            self.events.put(("log", f"ÇIKIŞ GÜVENLİK ENGELİ {symbol}: başka/manuel satış emri bulundu; dokunulmadı."))
+            return False
+
+        group_legs = [
+            o for o in sell_orders
+            if group_id and str(o.get("group_id") or "") == str(group_id)
+        ]
+        for leg in group_legs:
+            status = str(leg.get("status", "")).lower()
+            if status in ("filled", "canceled", "expired", "rejected", "replaced", "pending_cancel"):
+                continue
+            order_id = leg.get("id")
+            if not order_id:
+                self.events.put(("log", f"ÇIKIŞ GÜVENLİK ENGELİ {symbol}: koruyucu emrin kimliği okunamadı."))
+                return False
+            try:
+                self.broker.cancel_order(order_id)
+            except Exception as exc:
+                # An OCO sibling may have been canceled automatically or filled during cancellation.
+                self.events.put(("log", f"{symbol} koruyucu emir iptal yanıtı: {exc}"))
+
+        # Wait for both OCO legs to leave the open-order book before sending a market close.
+        remaining = []
+        for _ in range(12):
+            time.sleep(0.25)
+            fresh_orders = self.broker.open_orders()
+            remaining = [
+                o for o in fresh_orders
+                if o.get("symbol") == symbol
+                and str(o.get("side", "")).lower() == "sell"
+                and group_id
+                and str(o.get("group_id") or "") == str(group_id)
+            ]
+            if not remaining:
+                open_orders = fresh_orders
+                break
+        if remaining:
+            self.events.put(("log", f"ÇIKIŞ ERTELENDİ {symbol}: zarar-kes/kâr-al emirleri henüz kapanmadı; pozisyon korunuyor."))
+            return False
+
+        fresh_sells = [
+            o for o in open_orders
+            if o.get("symbol") == symbol and str(o.get("side", "")).lower() == "sell"
+        ]
+        if fresh_sells:
+            self.events.put(("log", f"ÇIKIŞ GÜVENLİK ENGELİ {symbol}: iptal sonrasında başka satış emri kaldı; pozisyona dokunulmadı."))
+            return False
+
+        fresh_position = next((p for p in self.broker.positions() if p.get("symbol") == symbol), None)
+        if not fresh_position:
+            self.managed_symbols.discard(symbol)
+            self.managed_groups.pop(symbol, None)
+            self.managed_protection.pop(symbol, None)
+            self._save_management_state()
+            self.events.put(("log", f"{symbol}: koruyucu emir tetiklenmiş ve pozisyon kapanmış."))
+            return True
+
+        try:
+            result = self.broker.close_position(symbol)
+            self.events.put(("log", f"ASTRATRADE PAPER ÇIKIŞ {symbol} | tam pozisyon kapatma emri: {result.get('status', 'gönderildi')}."))
+            return True
+        except Exception as exc:
+            # If the market-close request fails after canceling our OCO legs,
+            # restore the exact saved protection rather than leaving the holding naked.
+            fresh_position = next((p for p in self.broker.positions() if p.get("symbol") == symbol), None)
+            if fresh_position and take_profit > 0 and stop_loss > 0:
+                try:
+                    qty = abs(float(fresh_position.get("qty", 0) or 0))
+                    self.broker.restore_oco_protection(symbol, qty, take_profit, stop_loss)
+                    self.events.put(("log", f"ÇIKIŞ BAŞARISIZ {symbol}: {exc}. Eski zarar-kes/kâr-al koruması yeniden kuruldu."))
+                except Exception as protect_exc:
+                    self.events.put(("log", f"KRİTİK KORUMA HATASI {symbol}: satış başarısız ({exc}); OCO koruması da kurulamadı ({protect_exc}). Bot güvenlik için durduruluyor."))
+                    self.stop.set()
+            else:
+                self.events.put(("log", f"KRİTİK ÇIKIŞ HATASI {symbol}: satış emri gönderilemedi ({exc}); koruyucu fiyatlar bulunamadığından otomatik kapatma denemesi yapılmadı."))
+                self.stop.set()
+            return False
 
     def run(self):
         self.broker.account()
         assets = self.broker.assets()
-        eligible = set()
-        for asset in assets:
-            name = str(asset.get("name", "")).lower()
-            exchange = str(asset.get("exchange", "")).upper()
-            symbol = str(asset.get("symbol", "")).strip()
-            is_common = "common stock" in name or "common shares" in name
-            excluded = any(term in name for term in EXCLUDED_NAME_TERMS)
-            if symbol and asset.get("tradable") and str(asset.get("status", "")).lower() == "active" and exchange in EXCHANGES and is_common and not excluded:
-                eligible.add(symbol)
-        symbols = sorted(eligible)
+        symbols = sorted({str(a.get("symbol", "")).strip() for a in assets if is_eligible_common_stock(a)})
         if not symbols:
             raise RuntimeError("Alpaca'dan uygun ABD adi hissesi alınamadı.")
         self.events.put(("log", f"Tarama evreni: {len(symbols)} aktif NYSE/NASDAQ/AMEX adi hissesi."))
         batch_size = 200
         scan_interval = 300
         offset = 0
-        self.events.put(("log", "Strateji: uzun trend + EMA20/50 + MACD + RSI + 20 günlük kırılım + hacim teyidi."))
+        self.events.put(("log", "Strateji: tamamlanmış günlük mumlarda SMA200 + EMA20/50 + MACD + Wilder RSI + 20 günlük kırılım + hacim teyidi."))
         self.events.put(("log", "Risk motoru: işlem başına %0,25 risk, pozisyon başına azami %7, toplam yönetilen maruziyet %30, günlük zarar sınırı %1,5, zirveden düşüş sınırı %5."))
         while not self.stop.is_set():
             batch = symbols[offset:offset+batch_size]
-            offset = (offset + batch_size) % len(symbols)
+            offset = (offset+batch_size) % len(symbols)
             try:
                 bars = self.broker.bars(batch).get("bars", {})
                 bar_counts = {sym: len(bars.get(sym, [])) for sym in batch}
@@ -496,21 +620,38 @@ class Bot:
                 clock = self.broker.clock()
                 market_day = str(clock.get("timestamp", ""))[:10]
                 spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
-                # During an open session, Alpaca's latest daily candle is incomplete.
-                # Use only completed daily candles for technical indicators and volume confirmation.
-                if clock.get("is_open") and spy_rows and str(spy_rows[-1].get("t", ""))[:10] == market_day:
-                    spy_signal_rows = spy_rows[:-1]
-                else:
-                    spy_signal_rows = spy_rows
+                spy_signal_rows, _, _ = prepare_daily_signal_rows(spy_rows, bool(clock.get("is_open")), market_day)
                 spy = analyze(spy_signal_rows)
                 market_ok = bool(spy and spy["price"] > spy["sma200"] and spy["ema50"] > spy["sma200"])
+
                 positions = self.broker.positions()
                 held = {p["symbol"]: p for p in positions}
                 open_orders = self.broker.open_orders()
-                pending = {o["symbol"] for o in open_orders}
+                pending = {o.get("symbol") for o in open_orders if o.get("symbol")}
+                pending_buy_symbols = {
+                    o.get("symbol") for o in open_orders
+                    if o.get("symbol") and str(o.get("side", "")).lower() == "buy"
+                }
+                pending_market_sell_symbols = {
+                    o.get("symbol") for o in open_orders
+                    if o.get("symbol") and str(o.get("side", "")).lower() == "sell" and not o.get("group_role")
+                }
+
+                # Newer Alpaca order responses expose group_id/group_role on each OCO leg.
+                # Recover those IDs when upgrading from an earlier AstraTrade build.
+                for order in open_orders:
+                    symbol = order.get("symbol")
+                    if symbol in self.managed_symbols and order.get("group_id") and order.get("group_role") in ("take_profit", "stop_loss"):
+                        self.managed_groups[symbol] = str(order["group_id"])
+
                 active_symbols = set(held) | pending
+                removed_symbols = self.managed_symbols - active_symbols
                 self.managed_symbols.intersection_update(active_symbols)
-                save_managed_symbols(self.managed_symbols)
+                for removed in removed_symbols:
+                    self.managed_groups.pop(removed, None)
+                    self.managed_protection.pop(removed, None)
+                self._save_management_state()
+
                 managed_active = set(self.managed_symbols)
                 reserved = set(held) | pending
                 external_positions = set(held) - managed_active
@@ -526,32 +667,45 @@ class Bot:
                     write_app_state(peak_equity=peak_equity)
                 peak_drawdown = (equity-peak_equity)/peak_equity if peak_equity else 0.0
                 risk_allowed = daily_return > -0.015 and peak_drawdown > -0.05
-                managed_exposure = sum(abs(float(p.get("market_value", 0) or 0)) for s, p in held.items() if s in managed_active)
+
+                managed_exposure = sum(
+                    abs(float(p.get("market_value", 0) or 0))
+                    for symbol, p in held.items() if symbol in managed_active
+                )
+                pending_buy_unfilled = pending_buy_symbols - set(held)
+                pending_managed_buys = pending_buy_unfilled & managed_active
+                # Reserve one maximum-sized slot for every unfilled entry; this prevents
+                # repeated scans/restarts from overspending the 30% portfolio exposure cap.
+                managed_exposure += len(pending_managed_buys) * equity * 0.07
+                reserved_cash = len(pending_buy_unfilled) * equity * 0.07
+                available_cash = max(0.0, cash-reserved_cash)
+
                 self.events.put(("log", f"Hesap: {len(held)} pozisyon | AstraTrade: {len(managed_active)}/5 | eski/harici: {len(external_positions)} | günlük değişim: {daily_return*100:.2f}% | zirveden düşüş: {peak_drawdown*100:.2f}%."))
                 if not market_ok:
-                    self.events.put(("log", "PİYASA FİLTRESİ: SPY uzun vadeli trendi olumlu değil veya veri yetersiz; yeni alışlar bekletiliyor. Mevcut AstraTrade pozisyonları yine izleniyor."))
+                    self.events.put(("log", "PİYASA FİLTRESİ: SPY uzun vadeli trendi olumlu değil veya veri yetersiz; yeni alışlar bekletiliyor."))
                 if not risk_allowed:
-                    self.events.put(("log", "RİSK KİLİDİ: Günlük %1,5 zarar veya portföy zirvesinden %5 düşüş sınırı aşıldı; yeni alışlar durduruldu. Satış/çıkış sinyalleri izlenmeye devam ediyor."))
+                    self.events.put(("log", "RİSK KİLİDİ: Günlük %1,5 zarar veya zirveden %5 düşüş sınırı aşıldı; yeni alışlar kilitlendi."))
+
                 scanned = 0
                 best_score = 0.0
                 buy_signal_count = 0
                 blocked = {"trend": 0, "score": 0, "liquidity": 0, "other": 0}
+                stale_price_count = 0
                 for sym in batch:
                     if self.stop.is_set():
                         break
                     raw_rows = bars.get(sym, [])
-                    signal_rows = raw_rows
-                    execution_price = None
-                    if clock.get("is_open") and raw_rows and str(raw_rows[-1].get("t", ""))[:10] == market_day:
-                        # Do not compare partial-session volume with full-day averages.
-                        signal_rows = raw_rows[:-1]
-                        execution_price = float(raw_rows[-1].get("c", 0) or 0)
+                    signal_rows, execution_price, fresh_price = prepare_daily_signal_rows(
+                        raw_rows, bool(clock.get("is_open")), market_day
+                    )
                     f = analyze(signal_rows)
                     if not f:
                         continue
                     live_price = execution_price if execution_price and execution_price > 0 else f["price"]
                     if live_price < 5:
                         continue
+                    if clock.get("is_open") and not fresh_price:
+                        stale_price_count += 1
                     action = f["action"]
                     best_score = max(best_score, f["score"])
                     if action == "BUY":
@@ -568,41 +722,50 @@ class Bot:
                             blocked["other"] += 1
                     scanned += 1
                     self.events.put(("decision", (sym, action, f["score"], live_price, f["rsi"])))
-                    if not clock.get("is_open") or sym in pending:
+
+                    if not clock.get("is_open"):
                         continue
-                    if action == "BUY" and market_ok and risk_allowed and sym not in reserved and len(managed_active) < MAX_MANAGED_POSITIONS:
+                    if sym in pending_buy_symbols:
+                        continue
+
+                    if action == "BUY" and fresh_price and market_ok and risk_allowed and sym not in reserved and len(managed_active) < MAX_MANAGED_POSITIONS:
                         distance = max(2.0*f["atr"], live_price*0.015)
                         if distance <= 0 or distance >= live_price*0.25:
                             continue
-                        max_risk_dollars = equity * 0.0025
-                        managed_room = max(0.0, equity*0.30-managed_exposure)
-                        qty_by_risk = int(max_risk_dollars/distance)
-                        qty_by_position = int(equity*0.07/live_price)
-                        qty_by_exposure = int(managed_room/live_price)
-                        qty_by_cash = int(max(cash, 0)*0.98/live_price)
-                        qty = max(0, min(qty_by_risk, qty_by_position, qty_by_exposure, qty_by_cash))
+                        qty = calculate_order_qty(equity, available_cash, live_price, distance, managed_exposure)
                         if qty:
                             stop_price = round(live_price-distance, 2)
                             take_profit_price = round(live_price+3.0*distance, 2)
-                            result = self.broker.order(sym, qty, "buy", take_profit=take_profit_price, stop_loss=stop_price)
-                            pending.add(sym)
-                            reserved.add(sym)
-                            managed_active.add(sym)
+                            try:
+                                result = self.broker.order(sym, qty, "buy", take_profit=take_profit_price, stop_loss=stop_price)
+                            except Exception as order_error:
+                                self.events.put(("log", f"ALIŞ EMRİ REDDEDİLDİ {sym}: {order_error}"))
+                                continue
                             self.managed_symbols.add(sym)
-                            save_managed_symbols(self.managed_symbols)
-                            managed_exposure += qty*live_price
-                            cash = max(0.0, cash-qty*live_price)
-                            self.events.put(("log", f"ASTRATRADE PAPER ALIŞ {sym} x{qty} | skor {f['score']*100:.0f}/100 | risk USD {qty*distance:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
-                    elif action == "SELL" and sym in held and sym in self.managed_symbols:
-                        qty = abs(float(held[sym].get("qty", 0) or 0))
-                        if qty:
-                            result = self.broker.order(sym, qty, "sell")
+                            if result.get("group_id"):
+                                self.managed_groups[sym] = str(result["group_id"])
+                            self.managed_protection[sym] = {
+                                "take_profit": take_profit_price,
+                                "stop_loss": stop_price,
+                                "qty": qty
+                            }
+                            self._save_management_state()
+                            managed_active.add(sym)
+                            reserved.add(sym)
                             pending.add(sym)
-                            self.events.put(("log", f"ASTRATRADE PAPER ÇIKIŞ {sym} x{qty:g} | {result.get('status')}"))
+                            pending_buy_symbols.add(sym)
+                            managed_exposure += qty*live_price
+                            available_cash = max(0.0, available_cash-qty*live_price)
+                            self.events.put(("log", f"ASTRATRADE PAPER ALIŞ {sym} x{qty} | skor {f['score']*100:.0f}/100 | planlanan risk USD {qty*distance:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
+                    elif action == "SELL" and sym in held and sym in self.managed_symbols:
+                        if sym in pending_market_sell_symbols:
+                            continue
+                        self._close_managed_position(sym, open_orders)
                 self.events.put(("status", (len(symbols), scanned, equity, cash, len(held), bool(clock.get("is_open")), daily_return, len(managed_active))))
                 data_symbols = sum(1 for count in bar_counts.values() if count > 0)
                 self.events.put(("log", f"Tarama kalitesi: {scanned} analiz | en yüksek skor {best_score:.2f}/1,00 | BUY sinyali {buy_signal_count}."))
-                self.events.put(("log", f"BUY engelleri (çakışabilir): ana trend {blocked['trend']}, skor {blocked['score']}, likidite {blocked['liquidity']}, diğer {blocked['other']}. Teknik eşik 6 koşuldan 5'i; 10 milyon USD likidite ve SPY filtresi ayrıca zorunlu."))
+                self.events.put(("log", f"BUY engelleri (çakışabilir): trend {blocked['trend']}, skor {blocked['score']}, likidite {blocked['liquidity']}, diğer {blocked['other']}. Alış için 6 teknik koşuldan en az 5'i ve 10 milyon USD ortalama dolar hacmi zorunlu."))
+                self.events.put(("log", f"Canlı fiyatı güncel olmayan sembol: {stale_price_count}; bu sembollere yeni alış gönderilmedi."))
                 self.events.put(("log", f"Veri: {data_symbols}/{len(batch)} sembol; {total_daily_bars} günlük bar; 220+ bar geçmişi olan: {sufficient_history}. SPY piyasa filtresi: {'OLUMLU' if market_ok else 'OLUMSUZ'}."))
                 self.events.put(("log", f"Veri örneği: {samples}"))
                 if data_symbols == 0:
