@@ -1185,7 +1185,7 @@ class Bot:
                 order_blocked = {
                     "piyasa_kapali": 0, "veri_eski": 0, "canli_fiyat": 0, "spy_filtresi": 0,
                     "gunluk_risk": 0, "bekleyen_emir": 0, "pozisyon_limiti": 0,
-                    "miktar_sifir": 0
+                    "dolar_hedefi_uzak": 0, "miktar_sifir": 0
                 }
                 stale_price_count = 0
                 for sym in batch:
@@ -1691,7 +1691,7 @@ class App:
                 daily=self.broker.history(symbol,"1Day",400,adjustment="split")
                 spy_daily=self.broker.history("SPY","1Day",400,adjustment="split")
                 clock=self.broker.clock()
-                result=backtest_intraday_strategy(intraday,daily,spy_daily,now=clock.get("timestamp"))
+                result=backtest_intraday_strategy(intraday,daily,spy_daily,now=clock.get("timestamp"),profit_target_usd=float(self.profit_target_entry.get().strip().replace(",", ".")))
                 self.events.put(("backtest",(symbol,result)))
             except Exception as exc:
                 self.events.put(("backtest_error",str(exc)))
