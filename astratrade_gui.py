@@ -278,6 +278,20 @@ def prepare_daily_signal_rows(rows, market_is_open, market_day):
         close = 0.0
     return rows, close if close > 0 else None, False
 
+def confirm_live_entry(signal, current_price):
+    """Avoid entries after the breakout has failed or price has become overextended."""
+    try:
+        price = float(current_price)
+        signal_close = float(signal["price"])
+        ema20_value = float(signal["ema20"])
+        breakout = float(signal["prior_20_high"])
+        atr = float(signal["atr"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if min(price, signal_close, ema20_value, breakout, atr) <= 0:
+        return False
+    return price > ema20_value and price > breakout and price <= signal_close + 1.5*atr
+
 def is_eligible_common_stock(asset):
     name = str(asset.get("name", "")).lower()
     exchange = str(asset.get("exchange", "")).upper()
@@ -362,6 +376,7 @@ def analyze(rows):
         "price": price, "open": o[-1], "ema20": e20, "ema50": e50,
         "sma200": sma200, "macd_hist": macd_hist, "rsi": rsi,
         "atr": atr, "dollar_vol": dollar_vol, "relative_volume": relative_volume,
+        "prior_20_high": prior_20_high,
         "score": score, "action": action, "conditions": conditions
     }
 def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
@@ -733,7 +748,7 @@ class Bot:
                 buy_signal_count = 0
                 blocked = {"trend": 0, "score": 0, "liquidity": 0, "other": 0}
                 order_blocked = {
-                    "piyasa_kapali": 0, "veri_eski": 0, "spy_filtresi": 0,
+                    "piyasa_kapali": 0, "veri_eski": 0, "canli_fiyat": 0, "spy_filtresi": 0,
                     "gunluk_risk": 0, "bekleyen_emir": 0, "pozisyon_limiti": 0,
                     "miktar_sifir": 0
                 }
@@ -777,6 +792,8 @@ class Bot:
                             order_blocked["bekleyen_emir"] += 1
                         elif not fresh_price:
                             order_blocked["veri_eski"] += 1
+                        elif not confirm_live_entry(f, live_price):
+                            order_blocked["canli_fiyat"] += 1
                         elif not market_ok:
                             order_blocked["spy_filtresi"] += 1
                         elif not risk_allowed:
