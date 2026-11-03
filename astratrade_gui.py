@@ -232,12 +232,13 @@ def analyze(rows):
         "macd_pozitif": macd_hist > 0,
         "rsi_uygun": 50 <= rsi <= 68,
         "20_gun_tepe": price > prior_20_high,
-        "hacim_onayi": relative_volume >= 1.10,
-        "likidite": dollar_vol >= 10_000_000
+        "hacim_onayi": relative_volume >= 1.10
     }
+    # Liquidity is a hard gate, not a second deduction in the technical score.
     score = sum(1 for value in conditions.values() if value) / len(conditions)
     trend_ok = conditions["uzun_trend"] and conditions["trend_sirasi"] and conditions["macd_pozitif"]
-    action = "BUY" if trend_ok and score >= 6/7 else ("SELL" if price < e20 and macd_hist < 0 and rsi < 45 else "HOLD")
+    liquid_enough = dollar_vol >= 10_000_000
+    action = "BUY" if trend_ok and score >= 5/6 and liquid_enough else ("SELL" if price < e20 and macd_hist < 0 and rsi < 45 else "HOLD")
     return {
         "price": price, "open": o[-1], "ema20": e20, "ema50": e50,
         "sma200": sma200, "macd_hist": macd_hist, "rsi": rsi,
@@ -426,8 +427,6 @@ class Bot:
                     best_score = max(best_score, f["score"])
                     if action == "BUY":
                         buy_signal_count += 1
-                    if action == "BUY" and f["dollar_vol"] < 10_000_000:
-                        action = "HOLD"
                     scanned += 1
                     self.events.put(("decision", (sym, action, f["score"], f["price"], f["rsi"])))
                     if not clock.get("is_open") or sym in pending:
@@ -463,7 +462,7 @@ class Bot:
                             self.events.put(("log", f"ASTRATRADE PAPER ÇIKIŞ {sym} x{qty:g} | {result.get('status')}"))
                 self.events.put(("status", (len(symbols), scanned, equity, cash, len(held), bool(clock.get("is_open")), daily_return, len(managed_active))))
                 data_symbols = sum(1 for count in bar_counts.values() if count > 0)
-                self.events.put(("log", f"Tarama kalitesi: {scanned} analiz içinde en yüksek skor {best_score:.2f}/1,00; BUY sinyali {buy_signal_count}. Alış eşiği 0,86 (7 koşulun en az 6'sı) ve SPY filtresi {'olumlu' if market_ok else 'olumsuz'}." ))
+                self.events.put(("log", f"Tarama kalitesi: {scanned} analiz içinde en yüksek teknik skor {best_score:.2f}/1,00; BUY sinyali {buy_signal_count}. Alış için 6 teknik koşuldan en az 5'i, 10 milyon USD likidite eşiği ve SPY filtresi birlikte aranır." ))
                 self.events.put(("log", f"Veri: {data_symbols}/{len(batch)} sembol; {total_daily_bars} günlük bar; 220+ bar geçmişi olan: {sufficient_history}. SPY piyasa filtresi: {'OLUMLU' if market_ok else 'OLUMSUZ'}."))
                 self.events.put(("log", f"Veri örneği: {samples}"))
                 if data_symbols == 0:
@@ -523,7 +522,7 @@ class App:
         self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET VE GÜVENLİ KAYDET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
         tk.Label(box,text="Başarılı bağlantıdan sonra anahtarlar Windows hesabına bağlı DPAPI şifrelemesiyle bu bilgisayarda saklanır ve sonraki açılışta otomatik yüklenir.",bg=panel,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",pady=4)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
-        tk.Label(settings,text="STRATEJİ: SMA200 uzun trend filtresi, EMA20/50 sıralaması, tutarlı MACD, RSI 50–68, 20 günlük tepe kırılımı ve hacim onayı. Ayrıca SPY piyasa rejimi kontrol edilir. Sistem makine öğrenmesi değildir ve kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
+        tk.Label(settings,text="STRATEJİ: SMA200 uzun trend filtresi, EMA20/50 sıralaması, MACD, RSI 50–68, 20 günlük tepe kırılımı ve hacim onayı. Altı teknik koşuldan en az beşi gerekir; 10 milyon USD günlük ortalama dolar hacmi ayrıca zorunludur. SPY piyasa rejimi de kontrol edilir. Sistem makine öğrenmesi değildir ve kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
         tk.Label(settings,text="Her alışta 2 ATR veya %1,5 asgari stop mesafesi ve 3R hedefli bracket emir kullanılır. İşlem başına özkaynağın %0,25’i, tek pozisyonda %7’si, AstraTrade pozisyonlarının toplamında %30’u aşılmaz. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alışlar kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlar satılmaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Tarama evreni yalnızca adı Common Stock / Common Shares olan aktif NYSE, NASDAQ ve NYSE American adi hisseleridir. ETF, kaldıraçlı/ters fon, varant, imtiyazlı pay, birim ve tahvil benzeri varlıklar dışarıda bırakılır. Alış için 20 günlük ortalama dolar hacmi en az 10 milyon USD ve en az 220 günlük fiyat geçmişi gerekir. Her 5 dakikada 200 sembol taranır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         # Midas benzeri mum grafiği: fiyat, EMA20/50 ve hacim.
