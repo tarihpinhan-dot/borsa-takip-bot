@@ -261,7 +261,7 @@ class Alpaca:
             raise RuntimeError("Alpaca emir sayfalaması beklenmeyen şekilde sonlandı; güvenlik için işlem taraması durduruldu.")
         return orders
     def bars(self, symbols, progress_callback=None):
-        """Fetch one year of daily IEX bars in resilient, restart-safe GET batches."""
+        """Fetch one year of daily IEX bars with safe retries and progress reporting."""
         collected = {}
         failed_symbols = set()
         total = len(symbols)
