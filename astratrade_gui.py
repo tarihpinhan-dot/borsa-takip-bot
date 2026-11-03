@@ -85,7 +85,10 @@ def analyze(rows):
     price=c[-1]; e20=ema(c[-100:],20); e50=ema(c[-150:],50); macd=ema(c[-80:],12)-ema(c[-100:],26)
     d=[c[i]-c[i-1] for i in range(len(c)-14,len(c))]
     gain=sum(max(0,x) for x in d)/14; loss=sum(max(0,-x) for x in d)/14
-    rsi=100 if loss==0 else 100-100/(1+gain/loss)
+    if gain == 0 and loss == 0: rsi=50
+    elif loss == 0: rsi=100
+    elif gain == 0: rsi=0
+    else: rsi=100-100/(1+gain/loss)
     tr=[max(h[i]-l[i],abs(h[i]-c[i-1]),abs(l[i]-c[i-1])) for i in range(len(c)-14,len(c))]
     atr=sum(tr)/14; dollar_vol=sum(c[-20+i]*v[-20+i] for i in range(20))/20
     ret20=price/c[-21]-1
@@ -131,7 +134,10 @@ class Bot:
                 try: sentiments=news_score(self.broker.news(batch).get("news",[]))
                 except Exception: sentiments={}
                 positions=self.broker.positions(); held={p["symbol"]:p for p in positions}
-                pending={o["symbol"] for o in self.broker.open_orders()}
+                open_orders=self.broker.open_orders()
+                pending={o["symbol"] for o in open_orders}
+                pending_buys={o["symbol"] for o in open_orders if str(o.get("side","")).lower()=="buy"}
+                reserved=set(held) | pending_buys
                 account=self.broker.account(); clock=self.broker.call(PAPER,"/v2/clock")
                 equity=float(account["equity"]); cash=float(account.get("cash",0))
                 last=float(account.get("last_equity",equity))
@@ -148,7 +154,7 @@ class Bot:
                     scanned+=1
                     self.events.put(("decision",(sym,action,score,f["price"],f["rsi"])))
                     if not clock.get("is_open") or sym in pending: continue
-                    if action=="BUY" and sym not in held and len(held)<5 and daily>-.02:
+                    if action=="BUY" and sym not in reserved and len(reserved)<5 and daily>-.02:
                         distance=max(1.5*f["atr"],f["price"]*.01)
                         if distance >= f["price"]*.80:
                             continue
@@ -158,6 +164,8 @@ class Bot:
                             take_profit_price=round(f["price"]+2*distance,2)
                             result=self.broker.order(sym,qty,"buy",take_profit=take_profit_price,stop_loss=stop_price)
                             pending.add(sym)
+                            pending_buys.add(sym)
+                            reserved.add(sym)
                             held[sym]={"symbol":sym,"qty":str(qty)}
                             cash=max(0.0,cash-qty*f["price"])
                             self.events.put(("log",f"SANAL ALIM {sym} x{qty} | skor {score:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
@@ -213,7 +221,7 @@ class App:
         self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
         tk.Label(settings,text="Strateji: EMA / RSI / MACD ve basit haber kelime puanlaması; bu sürüm makine öğrenmesi modeli değildir.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
-        tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz; en fazla 5 pozisyon ve işlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz. Açık pozisyonlar ve bekleyen alış emirleri birlikte en fazla 5 ile sınırlandırılır; işlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Son 1 yıllık günlük veriler 20'şer sembollük isteklerle alınır; böylece Alpaca'nın 10.000 toplam bar sınırı aşılmaz. Her 5 dakikada 200 sembol taranır. Veri sayıları faaliyet kayıtlarına yazılır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
         for col,title,width in [("time","ZAMAN",180),("symbol","HİSSE",100),("side","YÖN",100),("qty","ADET",100),("status","DURUM",180)]:
