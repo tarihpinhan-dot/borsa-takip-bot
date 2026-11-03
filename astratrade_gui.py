@@ -729,12 +729,18 @@ class App:
                         f"TEST SONU ÖZKAYNAK: USD {result['final']:,.2f} | NET GETİRİ: {result['return_pct']:.2f}%\n"
                         f"İŞLEM SAYISI: {result['trades']} | KAZANMA ORANI: {result['win_rate']:.1f}%\n"
                         f"PROFIT FACTOR: {pf} | MAKS. DÜŞÜŞ: {result['max_drawdown']:.2f}%\n"
-                        f"AYNI DÖNEM HİSSE AL-TUT GETİRİSİ: {result['benchmark']:.2f}%\n"
+                        f"AYNI HİSSE AL-TUT: {result['benchmark']:.2f}% | SPY AL-TUT: {result['spy_benchmark']:.2f}%\n"
                         f"İŞLEM BAŞINA ORT. K/Z: USD {result['avg_trade']:.2f}\n\n"
                         "Not: Tek hisse üzerinde tarihsel simülasyondur. Emir defteri, temettü, vergi ve tüm piyasa etkileri eksiksiz modellenmez; canlı sonuç garantisi değildir.\n")
                     self.backtest_output.delete("1.0","end"); self.backtest_output.insert("end",report)
                 elif kind=="backtest_error":
                     self.backtest_output.insert("end","TEST HATASI: "+value+"\n")
+                elif kind=="positions":
+                    for item in self.position_tree.get_children(): self.position_tree.delete(item)
+                    for pos in value:
+                        pnl=float(pos.get("unrealized_pl",0) or 0)
+                        vals=(pos.get("symbol",""),pos.get("qty",""),f"{float(pos.get('avg_entry_price',0) or 0):.2f}",f"{float(pos.get('current_price',0) or 0):.2f}",f"USD {float(pos.get('market_value',0) or 0):,.2f}",f"USD {pnl:+,.2f}",f"{float(pos.get('unrealized_plpc',0) or 0)*100:+.2f}%")
+                        self.position_tree.insert("","end",values=vals,tags=("profit" if pnl>=0 else "loss",))
                 elif kind=="chart_error": self.chart_status.configure(text="Grafik yüklenemedi: "+value)
                 elif kind=="chart":
                     self.chart_name,self.chart_rows,self.chart_timeframe=value
@@ -744,7 +750,7 @@ class App:
                     self.broker,account,saved=value; self.connection.configure(text="● ALPACA PAPER BAĞLI",fg="#36c99a")
                     self.result.configure(text=f"Bağlantı başarılı | Hesap: {account.get('status')} | Sanal bakiye: USD {float(account.get('equity',0)):,.2f} | API: {'GÜVENLİ KAYDEDİLDİ' if saved else 'KAYDEDİLEMEDİ'}",fg="#36c99a" if saved else "#ffc36d")
                     self.metrics["equity"].configure(text=f"USD {float(account.get('equity',0)):,.2f}"); self.metrics["cash"].configure(text=f"USD {float(account.get('cash',0)):,.2f}"); last=float(account.get("last_equity",account.get("equity",0)) or 0); eq=float(account.get("equity",0) or 0); self.metrics["daily"].configure(text=f"{((eq-last)/last*100) if last else 0:+.2f}%")
-                    self.test_button.configure(state="normal"); self.add_log("Alpaca Paper bağlantısı doğrulandı." if saved else "Bağlantı doğrulandı ancak API anahtarları güvenli kaydedilemedi."); self.refresh_portfolio()
+                    self.test_button.configure(state="normal"); self.add_log("Alpaca Paper bağlantısı doğrulandı." if saved else "Bağlantı doğrulandı ancak API anahtarları güvenli kaydedilemedi."); self.refresh_portfolio(); self.refresh_positions()
                 elif kind=="error":
                     self.result.configure(text="Bağlantı hatası: "+value,fg="#ff7373"); self.test_button.configure(state="normal"); messagebox.showerror("Alpaca",value)
                 elif kind=="decision":
@@ -753,6 +759,7 @@ class App:
                     n,count,equity,cash,positions,market,daily,managed=value
                     self.metrics["equity"].configure(text=f"USD {equity:,.2f}"); self.metrics["cash"].configure(text=f"USD {cash:,.2f}"); self.metrics["positions"].configure(text=f"{managed}/5")
                     self.metrics["daily"].configure(text=f"{daily*100:+.2f}%")
+                    self.refresh_positions()
                     self.market.configure(text=f"Piyasa: {'Açık' if market else 'Kapalı'} | Hisse evreni: {n} | Bu tur: {count}")
                 elif kind=="history":
                     for item in self.tree.get_children(): self.tree.delete(item)
