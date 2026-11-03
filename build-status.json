@@ -1,9 +1,9 @@
 {
   "status": "success",
-  "workflow_run_id": "41701241172",
+  "workflow_run_id": "41701648246",
   "run_attempt": "1",
-  "source_commit": "31c9fa6da6bf209e02dfebbd9af65dbcb841c4d1",
-  "branch": "main",
+  "source_commit": "2d1a03cc3b28020aaf572dd8b9e1171c64e402f2",
+  "branch": "ci/validate-intraday-strategy",
   "artifact_name": "AstraTradeAI-Windows",
-  "recorded_at_utc": "2026-11-03T19:14:23.8059426Z"
+  "recorded_at_utc": "2026-11-03T19:16:54.2583173Z"
 }
