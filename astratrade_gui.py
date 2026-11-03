@@ -587,7 +587,7 @@ def analyze_intraday(rows, daily_signal):
         "price": price, "ema9": ema9, "ema21": ema21, "ema9_15": ema9_15,
         "ema21_15": ema21_15, "macd_hist": macd_hist, "rsi": rsi,
         "atr": atr, "vwap": vwap, "relative_volume": relative_volume,
-        "prior_12_high": previous_high, "score": score, "action": action,
+        "prior_6_high": previous_high, "score": score, "action": action,
         "conditions": conditions, "daily_uptrend": daily_uptrend,
         "dollar_vol": float(daily_signal.get("dollar_vol", 0))
     }
@@ -1274,6 +1274,7 @@ class Bot:
         scan_symbols = ranked[:300]
         if not scan_symbols:
             raise RuntimeError("20 milyon USD üzeri ortalama günlük dolar hacmine sahip yeterli aday bulunamadı.")
+        del daily_data
         self.daily_signals = daily_signals
         self.scan_symbols = scan_symbols
         spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
@@ -1458,11 +1459,10 @@ class Bot:
                                     take_profit=levels["target"], stop_loss=levels["stop"]
                                 )
                             except Exception as order_error:
-                                self.managed_symbols.discard(symbol)
-                                self.managed_groups.pop(symbol, None)
-                                self.managed_protection.pop(symbol, None)
-                                self._save_management_state()
-                                self.events.put(("log", f"ALIŞ EMRİ REDDEDİLDİ {symbol}: {order_error}"))
+                                # A timeout can happen after Alpaca accepted the order.
+                                # Keep the persisted owner/strategy metadata and reconcile it
+                                # against positions/open orders on the next scan before any retry.
+                                self.events.put(("log", f"ALIŞ EMRİ YANITI BELİRSİZ {symbol}: {order_error}. Yinelenen alıştan kaçınmak için Alpaca kaydı sonraki turda uzlaştırılacak."))
                                 continue
                             if result.get("group_id"):
                                 self.managed_groups[symbol] = str(result["group_id"])
