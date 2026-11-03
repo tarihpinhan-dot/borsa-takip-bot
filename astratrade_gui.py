@@ -1,4 +1,5 @@
-import base64, ctypes, json, math, os, queue, threading, time, urllib.parse, urllib.request, tkinter as tk
+import base64, ctypes, json, math, os, queue, threading, time, uuid, urllib.parse, urllib.request, tkinter as tk
+from urllib.error import HTTPError, URLError
 from datetime import datetime, timedelta, timezone
 from tkinter import ttk, messagebox
 
@@ -36,6 +37,22 @@ def load_managed_symbols():
 
 def save_managed_symbols(symbols):
     write_app_state(managed_symbols=sorted(set(symbols)))
+
+def load_managed_groups():
+    data = read_app_state().get("managed_groups", {})
+    if not isinstance(data, dict):
+        return {}
+    return {str(k).upper(): str(v) for k, v in data.items() if isinstance(k, str) and v}
+
+def save_managed_groups(groups):
+    write_app_state(managed_groups={str(k).upper(): str(v) for k, v in groups.items() if v})
+
+def load_managed_protection():
+    data = read_app_state().get("managed_protection", {})
+    return data if isinstance(data, dict) else {}
+
+def save_managed_protection(data):
+    write_app_state(managed_protection=data)
 
 CREDENTIAL_FILE = os.path.join(APP_DIR, "credentials.dat")
 
@@ -99,11 +116,22 @@ class Alpaca:
         self.headers = {"APCA-API-KEY-ID":key, "APCA-API-SECRET-KEY":secret, "Content-Type":"application/json"}
     def call(self, base, path, params=None, method="GET", body=None):
         url = base + path + (("?" + urllib.parse.urlencode(params)) if params else "")
-        data = json.dumps(body).encode() if body is not None else None
+        data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, headers=self.headers, method=method)
-        with urllib.request.urlopen(req, timeout=25) as r:
-            raw = r.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                raw = r.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw) if raw else {}
+                detail = payload.get("message") or payload.get("detail") or payload.get("code") or raw
+            except Exception:
+                detail = raw or str(exc.reason)
+            raise RuntimeError(f"Alpaca HTTP {exc.code} ({method} {path}): {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Alpaca bağlantı hatası ({path}): {exc.reason}") from exc
     def account(self): return self.call(PAPER, "/v2/account")
     def assets(self): return self.call(PAPER, "/v2/assets", {"status":"active","asset_class":"us_equity"})
     def positions(self): return self.call(PAPER, "/v2/positions")
@@ -121,6 +149,7 @@ class Alpaca:
                 "timeframe": "1Day",
                 "limit": 10000,
                 "feed": "iex",
+                "adjustment": "split",
                 "start": (datetime.now(timezone.utc) - timedelta(days=365)).isoformat(),
                 "end": datetime.now(timezone.utc).isoformat(),
                 "sort": "asc"
@@ -134,9 +163,10 @@ class Alpaca:
                     break
                 params["page_token"] = token
         return {"bars": collected}
-    def history(self, symbol, timeframe="1Day", days=365):
+    def history(self, symbol, timeframe="1Day", days=365, adjustment="raw"):
         params = {
             "timeframe": timeframe,
+            "adjustment": adjustment,
             "start": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
             "end": datetime.now(timezone.utc).isoformat(),
             "limit": 10000,
@@ -160,16 +190,42 @@ class Alpaca:
             "period": "1M", "timeframe": "1D"
         })
     def order(self, symbol, qty, side, take_profit=None, stop_loss=None):
-        body = {"symbol":symbol,"qty":str(qty),"side":side,"type":"market","time_in_force":"day","client_order_id":f"astra-{symbol.lower()}-{int(time.time())}"}
+        body = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": side,
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": f"astra-{symbol.lower()}-{uuid.uuid4().hex[:20]}"
+        }
         if side == "buy" and take_profit is not None and stop_loss is not None:
             body.update({
-                "time_in_force":"gtc",
-                "order_class":"bracket",
-                "take_profit":{"limit_price":f"{take_profit:.2f}"},
-                "stop_loss":{"stop_price":f"{stop_loss:.2f}"}
+                "time_in_force": "gtc",
+                "order_class": "bracket",
+                "take_profit": {"limit_price": f"{take_profit:.2f}"},
+                "stop_loss": {"stop_price": f"{stop_loss:.2f}"}
             })
-        req = urllib.request.Request(PAPER+"/v2/orders", data=json.dumps(body).encode(), headers=self.headers, method="POST")
-        with urllib.request.urlopen(req, timeout=25) as r: return json.loads(r.read().decode())
+        return self.call(PAPER, "/v2/orders", method="POST", body=body)
+
+    def cancel_order(self, order_id):
+        return self.call(PAPER, "/v2/orders/" + urllib.parse.quote(str(order_id)), method="DELETE")
+
+    def close_position(self, symbol):
+        return self.call(PAPER, "/v2/positions/" + urllib.parse.quote(symbol), method="DELETE")
+
+    def restore_oco_protection(self, symbol, qty, take_profit, stop_loss):
+        body = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": "sell",
+            "type": "limit",
+            "time_in_force": "gtc",
+            "order_class": "oco",
+            "take_profit": {"limit_price": f"{take_profit:.2f}"},
+            "stop_loss": {"stop_price": f"{stop_loss:.2f}"},
+            "client_order_id": f"astra-protect-{symbol.lower()}-{uuid.uuid4().hex[:16]}"
+        }
+        return self.call(PAPER, "/v2/orders", method="POST", body=body)
 
 def ema(values, n):
     if not values:
@@ -191,6 +247,61 @@ def ema_series(values, n):
         result.append(value)
     return result
 
+def prepare_daily_signal_rows(rows, market_is_open, market_day):
+    """
+    Return completed daily bars, the current session's latest price (if present),
+    and a flag indicating whether that price is fresh enough for a live entry.
+    """
+    rows = rows or []
+    if not rows:
+        return [], None, False
+    last_day = str(rows[-1].get("t", ""))[:10]
+    if market_is_open:
+        if market_day and last_day == market_day and len(rows) >= 2:
+            try:
+                live_price = float(rows[-1].get("c", 0) or 0)
+            except (TypeError, ValueError):
+                live_price = 0.0
+            return rows[:-1], live_price if live_price > 0 else None, live_price > 0
+        return rows, None, False
+    try:
+        close = float(rows[-1].get("c", 0) or 0)
+    except (TypeError, ValueError):
+        close = 0.0
+    return rows, close if close > 0 else None, False
+
+def is_eligible_common_stock(asset):
+    name = str(asset.get("name", "")).lower()
+    exchange = str(asset.get("exchange", "")).upper()
+    symbol = str(asset.get("symbol", "")).strip()
+    is_common = "common stock" in name or "common shares" in name
+    excluded = any(term in name for term in EXCLUDED_NAME_TERMS)
+    return bool(
+        symbol
+        and asset.get("tradable")
+        and str(asset.get("status", "")).lower() == "active"
+        and exchange in EXCHANGES
+        and is_common
+        and not excluded
+    )
+
+def calculate_order_qty(equity, available_cash, price, stop_distance, managed_exposure):
+    """Return integer shares while enforcing risk, per-position, exposure and cash caps."""
+    equity = max(0.0, float(equity))
+    available_cash = max(0.0, float(available_cash))
+    price = float(price)
+    stop_distance = float(stop_distance)
+    managed_exposure = max(0.0, float(managed_exposure))
+    if equity <= 0 or price <= 0 or stop_distance <= 0:
+        return 0
+    risk_budget = equity * 0.0025
+    exposure_room = max(0.0, equity * 0.30 - managed_exposure)
+    qty_by_risk = int(risk_budget / stop_distance)
+    qty_by_position = int(equity * 0.07 / price)
+    qty_by_exposure = int(exposure_room / price)
+    qty_by_cash = int(available_cash * 0.98 / price)
+    return max(0, min(qty_by_risk, qty_by_position, qty_by_exposure, qty_by_cash))
+
 def analyze(rows):
     # Long-only daily swing strategy; all indicators use the same price series.
     if len(rows) < 220:
@@ -207,13 +318,13 @@ def analyze(rows):
     macd_line = [a - b for a, b in zip(ema_series(c, 12), ema_series(c, 26))]
     macd_signal = ema(macd_line[-40:], 9)
     macd_hist = macd_line[-1] - macd_signal
-    gains, losses = [], []
-    for i in range(len(c)-14, len(c)):
-        change = c[i] - c[i-1]
-        gains.append(max(0.0, change))
-        losses.append(max(0.0, -change))
-    avg_gain = sum(gains) / 14
-    avg_loss = sum(losses) / 14
+    changes = [c[i] - c[i-1] for i in range(1, len(c))]
+    initial = changes[:14]
+    avg_gain = sum(max(0.0, x) for x in initial) / 14
+    avg_loss = sum(max(0.0, -x) for x in initial) / 14
+    for change in changes[14:]:
+        avg_gain = (avg_gain * 13 + max(0.0, change)) / 14
+        avg_loss = (avg_loss * 13 + max(0.0, -change)) / 14
     if avg_loss == 0:
         rsi = 100.0 if avg_gain else 50.0
     else:
