@@ -1683,8 +1683,16 @@ class App:
         if not symbol or not symbol.isalnum():
             messagebox.showwarning("Hisse kodu","Geçerli bir hisse kodu gir.")
             return
+        try:
+            profit_target = float(self.profit_target_entry.get().strip().replace(",", "."))
+            if not math.isfinite(profit_target) or not 1.0 <= profit_target <= 10000.0:
+                raise ValueError
+        except (TypeError, ValueError):
+            messagebox.showwarning("Kâr hedefi", "Test için kâr hedefini 1 ile 10.000 USD arasında gir.")
+            self.tabs.select(self.settings)
+            return
         self.backtest_output.delete("1.0","end")
-        self.backtest_output.insert("end",f"{symbol} için yaklaşık 30 günlük 5 dakikalık test verisi indiriliyor...\n")
+        self.backtest_output.insert("end",f"{symbol} için yaklaşık 30 günlük 5 dakikalık test verisi indiriliyor (hedef USD {profit_target:.2f})...\n")
         def work():
             try:
                 intraday=self.broker.history(symbol,"5Min",35,adjustment="raw")
