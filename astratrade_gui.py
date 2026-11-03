@@ -1,4 +1,4 @@
-import json, math, os, queue, threading, time, urllib.parse, urllib.request, tkinter as tk
+import base64, ctypes, json, math, os, queue, threading, time, urllib.parse, urllib.request, tkinter as tk
 from datetime import datetime, timedelta, timezone
 from tkinter import ttk, messagebox
 
@@ -14,23 +14,78 @@ LOG_FILE = os.path.join(APP_DIR, "astratrade.log")
 STATE_FILE = os.path.join(APP_DIR, "bot_state.json")
 MAX_MANAGED_POSITIONS = 5
 
-def load_managed_symbols():
+def read_app_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        values = data.get("managed_symbols", [])
-        return {str(x).upper() for x in values if isinstance(x, str) and x.strip()}
-    except FileNotFoundError:
-        return set()
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return set()
+        return {}
 
-def save_managed_symbols(symbols):
+def write_app_state(**updates):
+    data = read_app_state()
+    data.update(updates)
     temp_file = STATE_FILE + ".tmp"
     with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump({"managed_symbols": sorted(set(symbols))}, f, indent=2)
+        json.dump(data, f, indent=2)
     os.replace(temp_file, STATE_FILE)
 
+def load_managed_symbols():
+    values = read_app_state().get("managed_symbols", [])
+    return {str(x).upper() for x in values if isinstance(x, str) and x.strip()}
+
+def save_managed_symbols(symbols):
+    write_app_state(managed_symbols=sorted(set(symbols)))
+
+CREDENTIAL_FILE = os.path.join(APP_DIR, "credentials.dat")
+
+def _dpapi_transform(raw, protect=True):
+    if os.name != "nt":
+        raise RuntimeError("API anahtarlarını güvenli kaydetmek için Windows DPAPI gerekir.")
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+    crypt32 = ctypes.WinDLL("Crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("Kernel32", use_last_error=True)
+    input_buffer = ctypes.create_string_buffer(raw)
+    input_blob = DATA_BLOB(len(raw), ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_byte)))
+    output_blob = DATA_BLOB()
+    if protect:
+        crypt32.CryptProtectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(DATA_BLOB)]
+        crypt32.CryptProtectData.restype = ctypes.c_bool
+        ok = crypt32.CryptProtectData(ctypes.byref(input_blob), "AstraTrade AI Paper API", None, None, None, 1, ctypes.byref(output_blob))
+    else:
+        description = ctypes.c_wchar_p()
+        crypt32.CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.POINTER(ctypes.c_wchar_p), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(DATA_BLOB)]
+        crypt32.CryptUnprotectData.restype = ctypes.c_bool
+        ok = crypt32.CryptUnprotectData(ctypes.byref(input_blob), ctypes.byref(description), None, None, None, 1, ctypes.byref(output_blob))
+    if not ok:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        kernel32.LocalFree(ctypes.cast(output_blob.pbData, ctypes.c_void_p))
+
+def save_credentials(key, secret):
+    payload = json.dumps({"key": key, "secret": secret}).encode("utf-8")
+    encrypted = _dpapi_transform(payload, protect=True)
+    temp_file = CREDENTIAL_FILE + ".tmp"
+    with open(temp_file, "w", encoding="ascii") as f:
+        f.write(base64.b64encode(encrypted).decode("ascii"))
+    os.replace(temp_file, CREDENTIAL_FILE)
+
+def load_credentials():
+    try:
+        with open(CREDENTIAL_FILE, "r", encoding="ascii") as f:
+            encrypted = base64.b64decode(f.read().strip())
+        payload = json.loads(_dpapi_transform(encrypted, protect=False).decode("utf-8"))
+        return str(payload.get("key", "")), str(payload.get("secret", ""))
+    except FileNotFoundError:
+        return "", ""
+    except Exception as exc:
+        logline("Kayıtlı API bilgileri açılamadı: " + str(exc))
+        return "", ""
 def logline(msg):
     line = datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ") + str(msg)
     try:
@@ -79,9 +134,29 @@ class Alpaca:
                     break
                 params["page_token"] = token
         return {"bars": collected}
-    def news(self, symbols):
-        start = (datetime.now(timezone.utc)-timedelta(hours=24)).isoformat()
-        return self.call(DATA, "/v1beta1/news", {"symbols":",".join(symbols),"start":start,"limit":50})
+    def history(self, symbol, timeframe="1Day", days=365):
+        params = {
+            "timeframe": timeframe,
+            "start": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
+            "end": datetime.now(timezone.utc).isoformat(),
+            "limit": 10000,
+            "feed": "iex",
+            "sort": "asc"
+        }
+        rows = []
+        for _ in range(5):
+            page = self.call(DATA, "/v2/stocks/" + urllib.parse.quote(symbol.upper()) + "/bars", params)
+            rows.extend(page.get("bars", []))
+            token = page.get("next_page_token")
+            if not token:
+                break
+            params["page_token"] = token
+        return rows
+
+    def portfolio_history(self):
+        return self.call(PAPER, "/v2/account/portfolio/history", {
+            "period": "1M", "timeframe": "1D", "intraday_reporting": "market"
+        })
     def order(self, symbol, qty, side, take_profit=None, stop_loss=None):
         body = {"symbol":symbol,"qty":str(qty),"side":side,"type":"market","time_in_force":"day"}
         if side == "buy" and take_profit is not None and stop_loss is not None:
@@ -95,33 +170,78 @@ class Alpaca:
         with urllib.request.urlopen(req, timeout=25) as r: return json.loads(r.read().decode())
 
 def ema(values, n):
-    k=2/(n+1); v=values[0]
-    for x in values[1:]: v=k*x+(1-k)*v
-    return v
+    if not values:
+        return 0.0
+    k = 2 / (n + 1)
+    value = float(values[0])
+    for x in values[1:]:
+        value = k * float(x) + (1 - k) * value
+    return value
+
+def ema_series(values, n):
+    if not values:
+        return []
+    k = 2 / (n + 1)
+    value = float(values[0])
+    result = [value]
+    for x in values[1:]:
+        value = k * float(x) + (1 - k) * value
+        result.append(value)
+    return result
 
 def analyze(rows):
-    if len(rows)<55: return None
-    c=[float(x["c"]) for x in rows]; h=[float(x["h"]) for x in rows]; l=[float(x["l"]) for x in rows]; v=[float(x["v"]) for x in rows]
-    price=c[-1]; e20=ema(c[-100:],20); e50=ema(c[-150:],50); macd=ema(c[-80:],12)-ema(c[-100:],26)
-    d=[c[i]-c[i-1] for i in range(len(c)-14,len(c))]
-    gain=sum(max(0,x) for x in d)/14; loss=sum(max(0,-x) for x in d)/14
-    if gain == 0 and loss == 0: rsi=50
-    elif loss == 0: rsi=100
-    elif gain == 0: rsi=0
-    else: rsi=100-100/(1+gain/loss)
-    tr=[max(h[i]-l[i],abs(h[i]-c[i-1]),abs(l[i]-c[i-1])) for i in range(len(c)-14,len(c))]
-    atr=sum(tr)/14; dollar_vol=sum(c[-20+i]*v[-20+i] for i in range(20))/20
-    ret20=price/c[-21]-1
-    score=0.0
-    if price>e20>e50: score+=.30
-    if macd>0: score+=.20
-    if 45<=rsi<=68: score+=.15
-    if dollar_vol>=5_000_000: score+=.15
-    if ret20>0: score+=.10
-    score+=.10*(1 if macd>0 and ret20>0 else .5)
-    action="BUY" if score>=.75 else ("SELL" if price<e20 and macd<0 else "HOLD")
-    return {"price":price,"ema20":e20,"ema50":e50,"macd":macd,"rsi":rsi,"atr":atr,"dollar_vol":dollar_vol,"score":score,"action":action}
-
+    # Long-only daily swing strategy; all indicators use the same price series.
+    if len(rows) < 220:
+        return None
+    c = [float(x["c"]) for x in rows]
+    h = [float(x["h"]) for x in rows]
+    l = [float(x["l"]) for x in rows]
+    o = [float(x["o"]) for x in rows]
+    v = [float(x["v"]) for x in rows]
+    price = c[-1]
+    e20 = ema(c[-100:], 20)
+    e50 = ema(c[-150:], 50)
+    sma200 = sum(c[-200:]) / 200
+    macd_line = [a - b for a, b in zip(ema_series(c, 12), ema_series(c, 26))]
+    macd_signal = ema(macd_line[-40:], 9)
+    macd_hist = macd_line[-1] - macd_signal
+    gains, losses = [], []
+    for i in range(len(c)-14, len(c)):
+        change = c[i] - c[i-1]
+        gains.append(max(0.0, change))
+        losses.append(max(0.0, -change))
+    avg_gain = sum(gains) / 14
+    avg_loss = sum(losses) / 14
+    if avg_loss == 0:
+        rsi = 100.0 if avg_gain else 50.0
+    else:
+        rsi = 100 - 100 / (1 + avg_gain / avg_loss)
+    true_ranges = []
+    for i in range(len(c)-14, len(c)):
+        true_ranges.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+    atr = sum(true_ranges) / len(true_ranges)
+    avg_volume = sum(v[-21:-1]) / 20
+    relative_volume = (v[-1] / avg_volume) if avg_volume > 0 else 0.0
+    dollar_vol = sum(c[-20+i] * v[-20+i] for i in range(20)) / 20
+    prior_20_high = max(h[-21:-1])
+    conditions = {
+        "uzun_trend": price > sma200,
+        "trend_sirasi": e20 > e50,
+        "macd_pozitif": macd_hist > 0,
+        "rsi_uygun": 50 <= rsi <= 68,
+        "20_gun_tepe": price > prior_20_high,
+        "hacim_onayi": relative_volume >= 1.10,
+        "likidite": dollar_vol >= 10_000_000
+    }
+    score = sum(1 for value in conditions.values() if value) / len(conditions)
+    trend_ok = conditions["uzun_trend"] and conditions["trend_sirasi"] and conditions["macd_pozitif"]
+    action = "BUY" if trend_ok and score >= 6/7 else ("SELL" if price < e20 and macd_hist < 0 and rsi < 45 else "HOLD")
+    return {
+        "price": price, "open": o[-1], "ema20": e20, "ema50": e50,
+        "sma200": sma200, "macd_hist": macd_hist, "rsi": rsi,
+        "atr": atr, "dollar_vol": dollar_vol, "relative_volume": relative_volume,
+        "score": score, "action": action, "conditions": conditions
+    }
 def news_score(items):
     scores={}
     for item in items:
@@ -132,111 +252,127 @@ def news_score(items):
 
 class Bot:
     def __init__(self, broker, events, stop):
-        self.broker=broker
-        self.events=events
-        self.stop=stop
-        self.managed_symbols=load_managed_symbols()
+        self.broker = broker
+        self.events = events
+        self.stop = stop
+        self.managed_symbols = load_managed_symbols()
+
     def run(self):
         self.broker.account()
-        assets=self.broker.assets()
-        eligible=set()
+        assets = self.broker.assets()
+        eligible = set()
         for asset in assets:
-            name=str(asset.get("name","")).lower()
-            exchange=str(asset.get("exchange","")).upper()
-            symbol=str(asset.get("symbol","")).strip()
-            is_common_stock=("common stock" in name or "common shares" in name)
-            excluded=any(term in name for term in EXCLUDED_NAME_TERMS)
-            if (symbol and asset.get("tradable")
-                and str(asset.get("status","")).lower()=="active"
-                and exchange in EXCHANGES and is_common_stock and not excluded):
+            name = str(asset.get("name", "")).lower()
+            exchange = str(asset.get("exchange", "")).upper()
+            symbol = str(asset.get("symbol", "")).strip()
+            is_common = "common stock" in name or "common shares" in name
+            excluded = any(term in name for term in EXCLUDED_NAME_TERMS)
+            if symbol and asset.get("tradable") and str(asset.get("status", "")).lower() == "active" and exchange in EXCHANGES and is_common and not excluded:
                 eligible.add(symbol)
-        symbols=sorted(eligible)
-        excluded_count=max(0,len(assets)-len(symbols))
-        if not symbols: raise RuntimeError("Alpaca'dan adi hisse olarak tanımlanabilen uygun ABD hissesi gelmedi.")
-        self.events.put(("log",f"Varlık filtresi: adi hisse adı eşleşen {len(symbols)} sembol tutuldu; fon/ETF ve diğer uygun olmayan varlıklar dışarıda bırakıldı (ham liste: {len(assets)})."))
-        batch_size=200
-        scan_interval=300
-        self.events.put(("log",f"Bağlantı başarılı. Uygun hisse evreni: {len(symbols)}. Her turda {batch_size} hisse taranır; tur aralığı 5 dakika."))
-        offset=0
+        symbols = sorted(eligible)
+        if not symbols:
+            raise RuntimeError("Alpaca'dan uygun ABD adi hissesi alınamadı.")
+        self.events.put(("log", f"Tarama evreni: {len(symbols)} aktif NYSE/NASDAQ/AMEX adi hissesi."))
+        batch_size = 200
+        scan_interval = 300
+        offset = 0
+        self.events.put(("log", "Strateji: uzun trend + EMA20/50 + MACD + RSI + 20 günlük kırılım + hacim teyidi."))
+        self.events.put(("log", "Risk motoru: işlem başına %0,25 risk, pozisyon başına azami %7, toplam yönetilen maruziyet %30, günlük zarar sınırı %1,5, zirveden düşüş sınırı %5."))
         while not self.stop.is_set():
-            batch=symbols[offset:offset+batch_size]
-            offset=(offset+batch_size)%len(symbols)
+            batch = symbols[offset:offset+batch_size]
+            offset = (offset + batch_size) % len(symbols)
             try:
-                bars=self.broker.bars(batch).get("bars",{})
-                bar_counts={sym:len(bars.get(sym,[])) for sym in batch}
-                data_symbols=sum(1 for count in bar_counts.values() if count>0)
-                sufficient_history=sum(1 for count in bar_counts.values() if count>=55)
-                total_daily_bars=sum(bar_counts.values())
-                samples=", ".join(f"{sym}:{bar_counts[sym]}" for sym in batch[:8])
-                try: sentiments=news_score(self.broker.news(batch).get("news",[]))
-                except Exception: sentiments={}
-                positions=self.broker.positions(); held={p["symbol"]:p for p in positions}
-                open_orders=self.broker.open_orders()
-                pending={o["symbol"] for o in open_orders}
-                pending_buys={o["symbol"] for o in open_orders if str(o.get("side","")).lower()=="buy"}
-                # Only count positions opened by this AstraTrade installation toward
-                # its five-position strategy limit. Older/manual positions remain
-                # protected and are never sold by this bot.
-                active_symbols=set(held) | pending
+                bars = self.broker.bars(batch).get("bars", {})
+                bar_counts = {sym: len(bars.get(sym, [])) for sym in batch}
+                sufficient_history = sum(1 for count in bar_counts.values() if count >= 220)
+                total_daily_bars = sum(bar_counts.values())
+                samples = ", ".join(f"{sym}:{bar_counts[sym]}" for sym in batch[:8])
+                spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
+                spy = analyze(spy_rows)
+                market_ok = bool(spy and spy["price"] > spy["sma200"] and spy["ema50"] > spy["sma200"])
+                positions = self.broker.positions()
+                held = {p["symbol"]: p for p in positions}
+                open_orders = self.broker.open_orders()
+                pending = {o["symbol"] for o in open_orders}
+                active_symbols = set(held) | pending
                 self.managed_symbols.intersection_update(active_symbols)
                 save_managed_symbols(self.managed_symbols)
-                managed_active=set(self.managed_symbols)
-                reserved=set(held) | pending
-                external_positions=set(held) - managed_active
-                self.events.put(("log",f"Hesap pozisyonları: {len(held)} toplam; AstraTrade tarafından yönetilen: {len(managed_active)}/{MAX_MANAGED_POSITIONS}; eski/harici pozisyon: {len(external_positions)}."))
-                account=self.broker.account(); clock=self.broker.call(PAPER,"/v2/clock")
-                equity=float(account["equity"]); cash=float(account.get("cash",0))
-                last=float(account.get("last_equity",equity))
-                daily=(equity-last)/last if last else 0
-                scanned=0
+                managed_active = set(self.managed_symbols)
+                reserved = set(held) | pending
+                external_positions = set(held) - managed_active
+                account = self.broker.account()
+                clock = self.broker.clock()
+                equity = float(account.get("equity", 0) or 0)
+                cash = float(account.get("cash", 0) or 0)
+                last_equity = float(account.get("last_equity", equity) or equity)
+                daily_return = (equity-last_equity)/last_equity if last_equity else 0.0
+                state = read_app_state()
+                peak_equity = float(state.get("peak_equity", equity) or equity)
+                if equity > peak_equity:
+                    peak_equity = equity
+                    write_app_state(peak_equity=peak_equity)
+                peak_drawdown = (equity-peak_equity)/peak_equity if peak_equity else 0.0
+                risk_allowed = daily_return > -0.015 and peak_drawdown > -0.05
+                managed_exposure = sum(abs(float(p.get("market_value", 0) or 0)) for s, p in held.items() if s in managed_active)
+                self.events.put(("log", f"Hesap: {len(held)} pozisyon | AstraTrade: {len(managed_active)}/5 | eski/harici: {len(external_positions)} | günlük değişim: {daily_return*100:.2f}% | zirveden düşüş: {peak_drawdown*100:.2f}%."))
+                if not market_ok:
+                    self.events.put(("log", "PİYASA FİLTRESİ: SPY uzun vadeli trendi olumlu değil veya veri yetersiz; yeni alışlar bekletiliyor. Mevcut AstraTrade pozisyonları yine izleniyor."))
+                if not risk_allowed:
+                    self.events.put(("log", "RİSK KİLİDİ: Günlük %1,5 zarar veya portföy zirvesinden %5 düşüş sınırı aşıldı; yeni alışlar durduruldu. Satış/çıkış sinyalleri izlenmeye devam ediyor."))
+                scanned = 0
                 for sym in batch:
-                    if self.stop.is_set(): break
-                    rows=bars.get(sym,[])
-                    f=analyze(rows)
-                    if not f or f["price"]<5: continue
-                    sentiment=sentiments.get(sym,0.0)
-                    score=max(0,min(1,f["score"]+.05*sentiment))
-                    action="BUY" if score>=.75 else ("SELL" if f["action"]=="SELL" else "HOLD")
-                    if action=="BUY" and f["dollar_vol"] < 5_000_000:
-                        action="HOLD"
-                    scanned+=1
-                    self.events.put(("decision",(sym,action,score,f["price"],f["rsi"])))
-                    if not clock.get("is_open") or sym in pending: continue
-                    if action=="BUY" and sym not in reserved and len(managed_active)<MAX_MANAGED_POSITIONS and daily>-.02:
-                        distance=max(1.5*f["atr"],f["price"]*.01)
-                        if distance >= f["price"]*.80:
+                    if self.stop.is_set():
+                        break
+                    f = analyze(bars.get(sym, []))
+                    if not f or f["price"] < 5:
+                        continue
+                    action = f["action"]
+                    if action == "BUY" and f["dollar_vol"] < 10_000_000:
+                        action = "HOLD"
+                    scanned += 1
+                    self.events.put(("decision", (sym, action, f["score"], f["price"], f["rsi"])))
+                    if not clock.get("is_open") or sym in pending:
+                        continue
+                    if action == "BUY" and market_ok and risk_allowed and sym not in reserved and len(managed_active) < MAX_MANAGED_POSITIONS:
+                        distance = max(2.0*f["atr"], f["price"]*0.015)
+                        if distance <= 0 or distance >= f["price"]*0.25:
                             continue
-                        qty=max(0,min(int(equity*.005/distance),int(equity*.10/f["price"]),int(max(cash,0)*.98/f["price"])))
+                        max_risk_dollars = equity * 0.0025
+                        managed_room = max(0.0, equity*0.30-managed_exposure)
+                        qty_by_risk = int(max_risk_dollars/distance)
+                        qty_by_position = int(equity*0.07/f["price"])
+                        qty_by_exposure = int(managed_room/f["price"])
+                        qty_by_cash = int(max(cash, 0)*0.98/f["price"])
+                        qty = max(0, min(qty_by_risk, qty_by_position, qty_by_exposure, qty_by_cash))
                         if qty:
-                            stop_price=round(f["price"]-distance,2)
-                            take_profit_price=round(f["price"]+2*distance,2)
-                            result=self.broker.order(sym,qty,"buy",take_profit=take_profit_price,stop_loss=stop_price)
+                            stop_price = round(f["price"]-distance, 2)
+                            take_profit_price = round(f["price"]+3.0*distance, 2)
+                            result = self.broker.order(sym, qty, "buy", take_profit=take_profit_price, stop_loss=stop_price)
                             pending.add(sym)
-                            pending_buys.add(sym)
                             reserved.add(sym)
                             managed_active.add(sym)
                             self.managed_symbols.add(sym)
                             save_managed_symbols(self.managed_symbols)
-                            held[sym]={"symbol":sym,"qty":str(qty)}
-                            cash=max(0.0,cash-qty*f["price"])
-                            self.events.put(("log",f"ASTRATRADE SANAL ALIM {sym} x{qty} | skor {score:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
-                    elif action=="SELL" and sym in held and sym in self.managed_symbols:
-                        qty=abs(float(held[sym]["qty"]))
+                            managed_exposure += qty*f["price"]
+                            cash = max(0.0, cash-qty*f["price"])
+                            self.events.put(("log", f"ASTRATRADE PAPER ALIŞ {sym} x{qty} | skor {f['score']*100:.0f}/100 | risk USD {qty*distance:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
+                    elif action == "SELL" and sym in held and sym in self.managed_symbols:
+                        qty = abs(float(held[sym].get("qty", 0) or 0))
                         if qty:
-                            result=self.broker.order(sym,qty,"sell"); pending.add(sym)
-                            self.events.put(("log",f"SANAL SATIŞ {sym} x{qty:g} | {result.get('status')}"))
-                self.events.put(("status",(len(symbols),scanned,equity,float(account["cash"]),len(held),bool(clock.get("is_open")))))
-                self.events.put(("log",f"Veri yanıtı: {data_symbols}/{len(batch)} sembol; toplam günlük bar: {total_daily_bars}; en az 55 günlük geçmişi olan: {sufficient_history}."))
-                self.events.put(("log",f"Veri örneği (sembol:bar): {samples}"))
+                            result = self.broker.order(sym, qty, "sell")
+                            pending.add(sym)
+                            self.events.put(("log", f"ASTRATRADE PAPER ÇIKIŞ {sym} x{qty:g} | {result.get('status')}"))
+                self.events.put(("status", (len(symbols), scanned, equity, cash, len(held), bool(clock.get("is_open")))))
+                data_symbols = sum(1 for count in bar_counts.values() if count > 0)
+                self.events.put(("log", f"Veri: {data_symbols}/{len(batch)} sembol; {total_daily_bars} günlük bar; 220+ bar geçmişi olan: {sufficient_history}. SPY piyasa filtresi: {'OLUMLU' if market_ok else 'OLUMSUZ'}."))
+                self.events.put(("log", f"Veri örneği: {samples}"))
                 if data_symbols == 0:
-                    self.events.put(("log","VERİ UYARISI: IEX akışından bu gruptaki semboller için bar gelmedi. Paper API anahtarı çalışsa bile piyasa verisi erişimini ayrıca kontrol etmek gerekiyor."))
-                elif sufficient_history == 0:
-                    self.events.put(("log","VERİ UYARISI: Veri geldi ancak 55 günlük analiz için yeterli geçmiş yok."))
-                self.events.put(("log",f"Tarama tamamlandı: {scanned} hisse analiz edildi. Piyasa: {'açık' if clock.get('is_open') else 'kapalı'}; {'emir gönderimi mümkün' if clock.get('is_open') else 'yeni emir gönderilmedi'}."))
-            except Exception as exc: self.events.put(("log","Tarama hatası: "+str(exc)))
+                    self.events.put(("log", "VERİ UYARISI: IEX piyasa verisi bu grupta boş döndü."))
+                self.events.put(("log", f"Tarama tamamlandı: {scanned} hisse analiz edildi. Piyasa: {'açık' if clock.get('is_open') else 'kapalı'}."))
+            except Exception as exc:
+                self.events.put(("log", "Tarama hatası: " + str(exc)))
             self.stop.wait(scan_interval)
-        self.events.put(("log","Bot durduruldu."))
-
+        self.events.put(("log", "Bot durduruldu."))
 class App:
     def __init__(self, root):
         self.root=root; root.title("AstraTrade AI"); root.geometry("950x650"); root.configure(bg="#111827")
