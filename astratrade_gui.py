@@ -436,7 +436,7 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
 
         # Peak drawdown is persistent in live mode; do not start new trades after a 5% breach.
         drawdown_gate_open = peak <= 0 or last_marked_equity > peak*0.95
-        if not position and not closed_this_bar and signal["action"] == "BUY" and market_ok and drawdown_gate_open:
+        if not position and not closed_this_bar and signal["action"] == "BUY" and market_ok and drawdown_gate_open and confirm_live_entry(signal, day_open):
             entry = day_open * (1+slippage)
             distance = max(2.0*signal["atr"], signal["price"]*0.015)
             if distance > 0 and distance < entry*0.25:
@@ -907,7 +907,7 @@ class App:
         self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET VE GÜVENLİ KAYDET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
         tk.Label(box,text="Başarılı bağlantıdan sonra anahtarlar Windows hesabına bağlı DPAPI şifrelemesiyle bu bilgisayarda saklanır ve sonraki açılışta otomatik yüklenir.",bg=panel,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",pady=4)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
-        tk.Label(settings,text="STRATEJİ: SMA200 uzun trend filtresi, EMA20/50 sıralaması, MACD, RSI 50–68, 20 günlük tepe kırılımı ve hacim onayı. Altı teknik koşuldan en az beşi gerekir; 10 milyon USD günlük ortalama dolar hacmi ayrıca zorunludur. SPY piyasa rejimi de kontrol edilir. Sistem makine öğrenmesi değildir ve kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
+        tk.Label(settings,text="STRATEJİ: SMA200 uzun trend filtresi, EMA20/50 sıralaması, MACD, Wilder RSI 50–68, 20 günlük tepe kırılımı ve hacim onayı. Altı teknik koşuldan en az beşi gerekir; 10 milyon USD günlük ortalama dolar hacmi ayrıca zorunludur. Giriş anında fiyat EMA20 ve kırılım seviyesinin üzerinde olmalı; önceki kapanıştan 1,5 ATR fazla uzaksa alış yapılmaz. SPY piyasa rejimi de kontrol edilir. Sistem makine öğrenmesi değildir ve kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
         tk.Label(settings,text="Her alışta 2 ATR veya %1,5 asgari stop mesafesi ve 3R hedefli bracket emir kullanılır. İşlem başına özkaynağın %0,25’i, tek pozisyonda %7’si, AstraTrade pozisyonlarının toplamında %30’u aşılmaz. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alışlar kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlar satılmaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Tarama evreni yalnızca adı Common Stock / Common Shares olan aktif NYSE, NASDAQ ve NYSE American adi hisseleridir. ETF, kaldıraçlı/ters fon, varant, imtiyazlı pay, birim ve tahvil benzeri varlıklar dışarıda bırakılır. Alış için 20 günlük ortalama dolar hacmi en az 10 milyon USD ve en az 220 günlük fiyat geçmişi gerekir. Her 5 dakikada 200 sembol taranır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         # Midas benzeri mum grafiği: fiyat, EMA20/50 ve hacim.
