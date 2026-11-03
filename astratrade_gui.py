@@ -1451,7 +1451,7 @@ class Bot:
                     "piyasa_kapali": 0, "giris_saati": 0, "veri_eski": 0,
                     "gunluk_trend": 0, "spy_filtresi": 0, "gunluk_risk": 0,
                     "bekleyen_emir": 0, "pozisyon_limiti": 0, "stop_genis": 0,
-                    "miktar_sifir": 0
+                    "dolar_hedefi_uzak": 0, "miktar_sifir": 0
                 }
                 stale_count = 0
                 for symbol in scan_symbols:
@@ -1490,11 +1490,19 @@ class Bot:
                                 continue
                             qty = calculate_order_qty(
                                 equity, available_cash, live_price,
-                                levels["stop_distance"], managed_exposure
+                                levels["stop_distance"], managed_exposure,
+                                profit_target_usd=self.profit_target_usd
                             )
                             if not qty:
                                 order_blocked["miktar_sifir"] += 1
                                 continue
+                            dollar_target = dollar_profit_limit_price(
+                                live_price, qty, self.profit_target_usd
+                            )
+                            if not dollar_target or dollar_target["distance"] > live_price * 0.02:
+                                order_blocked["dolar_hedefi_uzak"] += 1
+                                continue
+                            levels["target"] = dollar_target["price"]
                             # Persist ownership and intended short-term protection before POSTing.
                             # This preserves intraday management if the process restarts just after
                             # Alpaca accepts the entry. A rejected POST rolls the state back.
@@ -1506,6 +1514,8 @@ class Bot:
                                 "strategy": "intraday_v1",
                                 "opened_at": now_utc.isoformat(),
                                 "max_hold_minutes": 45,
+                                "profit_target_usd": self.profit_target_usd,
+                                "estimated_target_profit_usd": dollar_target["estimated_gross_profit_usd"],
                                 "entry_price": live_price
                             }
                             self._save_management_state()
@@ -1531,7 +1541,7 @@ class Bot:
                             available_cash = max(0.0, available_cash - qty * live_price)
                             self.events.put((
                                 "log",
-                                f"ASTRATRADE PAPER KISA VADE ALIŞ {symbol} x{qty} | skor {signal['score']*100:.0f}/100 | giriş USD {live_price:.2f} | SL {levels['stop']:.2f} ({levels['stop_distance']/live_price*100:.2f}%) | TP {levels['target']:.2f} ({levels['target_distance']/live_price*100:.2f}%) | azami taşıma 45 dk | {result.get('status')}"
+                                f"ASTRATRADE PAPER KISA VADE ALIŞ {symbol} x{qty} | skor {signal['score']*100:.0f}/100 | giriş USD {live_price:.2f} | SL {levels['stop']:.2f} | TP {levels['target']:.2f} | brüt hedef yaklaşık USD {dollar_target['estimated_gross_profit_usd']:.2f} (tetik USD {self.profit_target_usd:.2f}) | 45 dk | {result.get('status')}"
                             ))
                     elif signal["action"] == "SELL" and symbol in held and symbol in self.managed_symbols:
                         meta = self.managed_protection.get(symbol, {})
