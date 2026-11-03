@@ -1339,7 +1339,7 @@ class Bot:
         )
         self.events.put(("log", f"Kısa vadeli izleme listesi: {len(scan_symbols)} en likit hisse | günlük ortalama dolar hacmi en az USD 20 milyon."))
         self.events.put(("log", "Strateji: 5 dakikalık EMA9/21 + VWAP + MACD + Wilder RSI + 6 mumluk kırılım + hacim; 15 dakikalık EMA9/21 teyidi; günlük SMA200 rejim filtresi."))
-        self.events.put(("log", "İşlem planı: hedef %0,80-%2,00; volatiliteye bağlı stop %0,50-%1,00; 45 dakika azami taşıma; 15:45 ET gün sonu kapatma."))
+        self.events.put(("log", f"İşlem planı: pozisyon başına USD {self.profit_target_usd:.2f} gerçekleşmemiş kâr hedefi; hedef/stop en az 1,6; stop %0,50-%1,00; 45 dk azami taşıma; 15:45 ET gün sonu kapatma."))
         self.events.put(("log", "Risk motoru: işlem başına azami %0,25 risk bütçesi, pozisyon başına %7, yönetilen toplam maruziyet %30, günlük zarar kilidi %1,5, zirveden düşüş kilidi %5."))
 
         while not self.stop.is_set():
@@ -1699,7 +1699,7 @@ class App:
                 daily=self.broker.history(symbol,"1Day",400,adjustment="split")
                 spy_daily=self.broker.history("SPY","1Day",400,adjustment="split")
                 clock=self.broker.clock()
-                result=backtest_intraday_strategy(intraday,daily,spy_daily,now=clock.get("timestamp"),profit_target_usd=float(self.profit_target_entry.get().strip().replace(",", ".")))
+                result=backtest_intraday_strategy(intraday,daily,spy_daily,now=clock.get("timestamp"),profit_target_usd=profit_target)
                 self.events.put(("backtest",(symbol,result)))
             except Exception as exc:
                 self.events.put(("backtest_error",str(exc)))
