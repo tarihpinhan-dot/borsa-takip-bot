@@ -739,6 +739,144 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
         "trades_detail":trades
     }
 
+
+def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starting_equity=10000.0, slippage=0.001):
+    """Conservative single-symbol 5m simulation; stop wins when both barriers touch."""
+    intraday_rows = intraday_rows or []
+    if not intraday_rows or len(daily_rows or []) < 220 or len(spy_daily_rows or []) < 220:
+        raise ValueError("5 dakikalık test için intraday veri ve en az 220 günlük mum gerekli.")
+    last_stamp = _parse_utc(intraday_rows[-1]["t"]) + timedelta(minutes=6)
+    rows, _, _ = prepare_intraday_rows(intraday_rows, last_stamp)
+    if len(rows) < 80:
+        raise ValueError("Test dönemi içinde en az 80 tamamlanmış normal seans 5 dakikalık mum bulunamadı.")
+
+    ny = ZoneInfo("America/New_York")
+    daily_cache = {}
+    spy_cache = {}
+
+    def asof_signal(source, cache, day):
+        key = day.isoformat()
+        if key not in cache:
+            eligible = [
+                item for item in source
+                if _parse_utc(item.get("t")).astimezone(ny).date() < day
+            ]
+            cache[key] = analyze(eligible) if len(eligible) >= 220 else None
+        return cache[key]
+
+    equity = float(starting_equity)
+    peak = equity
+    max_dd = 0.0
+    wins, losses, trades = [], [], []
+    position = None
+    for i in range(60, len(rows)):
+        bar = rows[i]
+        local = _parse_utc(bar["t"]).astimezone(ny)
+        day = local.date()
+        daily_signal = asof_signal(daily_rows, daily_cache, day)
+        spy_signal = asof_signal(spy_daily_rows, spy_cache, day)
+        market_ok = bool(
+            spy_signal
+            and spy_signal["price"] > spy_signal["sma200"]
+            and spy_signal["ema50"] > spy_signal["sma200"]
+        )
+        signal = analyze_intraday(rows[:i], daily_signal)
+        bar_open = float(bar["o"])
+        bar_high = float(bar["h"])
+        bar_low = float(bar["l"])
+        bar_close = float(bar["c"])
+        exited = False
+
+        if position:
+            exit_price = None
+            reason = ""
+            if bar_low <= position["stop"]:
+                exit_price = min(bar_open, position["stop"]) * (1 - slippage)
+                reason = "STOP"
+            elif bar_high >= position["target"]:
+                exit_price = position["target"] * (1 - slippage)
+                reason = "HEDEF"
+            elif i - position["entry_index"] >= 12 or (local.hour * 60 + local.minute) >= 945:
+                exit_price = bar_close * (1 - slippage)
+                reason = "ZAMAN/GÜN SONU"
+            elif signal and signal["action"] == "SELL":
+                exit_price = bar_close * (1 - slippage)
+                reason = "TERS SİNYAL"
+            if exit_price is not None:
+                pnl = (exit_price - position["entry"]) * position["qty"]
+                equity += pnl
+                trades.append({"pnl": pnl, "entry": position["entry"], "exit": exit_price, "qty": position["qty"], "reason": reason})
+                (wins if pnl > 0 else losses).append(pnl)
+                position = None
+                exited = True
+
+        if (
+            not position and not exited and signal
+            and signal["action"] == "BUY" and market_ok
+            and 585 <= (local.hour * 60 + local.minute) < 900
+        ):
+            entry = bar_open * (1 + slippage)
+            levels = intraday_exit_levels(entry, signal["atr"])
+            if levels:
+                qty_by_risk = int(equity * 0.0025 / levels["stop_distance"])
+                qty_by_position = int(equity * 0.07 / entry)
+                qty = max(0, min(qty_by_risk, qty_by_position))
+                if qty > 0:
+                    position = {
+                        "entry": entry, "qty": qty, "stop": levels["stop"],
+                        "target": levels["target"], "entry_index": i
+                    }
+                    if bar_low <= position["stop"]:
+                        exit_price = min(bar_open, position["stop"]) * (1 - slippage)
+                        pnl = (exit_price - entry) * qty
+                        equity += pnl
+                        trades.append({"pnl": pnl, "entry": entry, "exit": exit_price, "qty": qty, "reason": "GİRİŞ MUMU STOP"})
+                        (wins if pnl > 0 else losses).append(pnl)
+                        position = None
+                    elif bar_high >= position["target"]:
+                        exit_price = position["target"] * (1 - slippage)
+                        pnl = (exit_price - entry) * qty
+                        equity += pnl
+                        trades.append({"pnl": pnl, "entry": entry, "exit": exit_price, "qty": qty, "reason": "GİRİŞ MUMU HEDEF"})
+                        (wins if pnl > 0 else losses).append(pnl)
+                        position = None
+
+        marked = equity
+        if position:
+            marked += (bar_close - position["entry"]) * position["qty"]
+        peak = max(peak, marked)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - marked) / peak)
+
+    if position:
+        exit_price = float(rows[-1]["c"]) * (1 - slippage)
+        pnl = (exit_price - position["entry"]) * position["qty"]
+        equity += pnl
+        trades.append({"pnl": pnl, "entry": position["entry"], "exit": exit_price, "qty": position["qty"], "reason": "TEST SONU"})
+        (wins if pnl > 0 else losses).append(pnl)
+        peak = max(peak, equity)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - equity) / peak)
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    first, last = float(rows[0]["c"]), float(rows[-1]["c"])
+    benchmark = ((last / first) - 1) * 100 if first else 0.0
+    spy_first, spy_last = float(spy_daily_rows[-2]["c"]), float(spy_daily_rows[-1]["c"])
+    spy_benchmark = ((spy_last / spy_first) - 1) * 100 if spy_first else 0.0
+    return {
+        "initial": starting_equity, "final": equity,
+        "return_pct": (equity / starting_equity - 1) * 100,
+        "trades": len(trades),
+        "win_rate": (len(wins) / len(trades) * 100) if trades else 0.0,
+        "profit_factor": profit_factor, "max_drawdown": max_dd * 100,
+        "benchmark": benchmark, "spy_benchmark": spy_benchmark,
+        "avg_trade": (sum(x["pnl"] for x in trades) / len(trades)) if trades else 0.0,
+        "trades_detail": trades
+    }
+
+
 def news_score(items):
     scores={}
     for item in items:
