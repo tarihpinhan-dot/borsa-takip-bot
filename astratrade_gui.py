@@ -34,7 +34,29 @@ class Alpaca:
     def positions(self): return self.call(PAPER, "/v2/positions")
     def clock(self): return self.call(PAPER, "/v2/clock")
     def open_orders(self): return self.call(PAPER, "/v2/orders", {"status":"open","limit":500})
-    def bars(self, symbols): return self.call(DATA, "/v2/stocks/bars", {"symbols":",".join(symbols),"timeframe":"1Day","limit":220,"feed":"iex"})
+    def bars(self, symbols):
+        # Alpaca defaults to the current day if start is omitted. Request a full year
+        # so EMA/RSI/MACD have enough daily history. The endpoint limit is total bars,
+        # not bars per symbol, so follow page tokens and merge all symbol rows.
+        params = {
+            "symbols": ",".join(symbols),
+            "timeframe": "1Day",
+            "limit": 10000,
+            "feed": "iex",
+            "start": (datetime.now(timezone.utc) - timedelta(days=365)).isoformat(),
+            "end": datetime.now(timezone.utc).isoformat(),
+            "sort": "asc"
+        }
+        collected = {}
+        for _ in range(10):
+            page = self.call(DATA, "/v2/stocks/bars", params)
+            for symbol, rows in page.get("bars", {}).items():
+                collected.setdefault(symbol, []).extend(rows)
+            token = page.get("next_page_token")
+            if not token:
+                break
+            params["page_token"] = token
+        return {"bars": collected}
     def news(self, symbols):
         start = (datetime.now(timezone.utc)-timedelta(hours=24)).isoformat()
         return self.call(DATA, "/v1beta1/news", {"symbols":",".join(symbols),"start":start,"limit":50})
@@ -90,11 +112,13 @@ class Bot:
         assets=self.broker.assets()
         symbols=sorted({a["symbol"] for a in assets if a.get("tradable") and str(a.get("status","")).lower().endswith("active") and str(a.get("exchange","")).upper() in EXCHANGES})
         if not symbols: raise RuntimeError("Alpaca uygun ABD hissesi listesi döndürmedi.")
-        self.events.put(("log",f"Bağlantı başarılı. Uygun hisse evreni: {len(symbols)}. Her turda 30 hisse taranır."))
+        batch_size=200
+        scan_interval=300
+        self.events.put(("log",f"Bağlantı başarılı. Uygun hisse evreni: {len(symbols)}. Her turda {batch_size} hisse taranır; tur aralığı 5 dakika."))
         offset=0
         while not self.stop.is_set():
-            batch=symbols[offset:offset+30]; offset=(offset+30)%len(symbols)
-            if len(batch)<30: batch+=symbols[:30-len(batch)]
+            batch=symbols[offset:offset+batch_size]
+            offset=(offset+batch_size)%len(symbols)
             try:
                 bars=self.broker.bars(batch).get("bars",{})
                 data_symbols=len(bars)
@@ -141,7 +165,7 @@ class Bot:
                 self.events.put(("log",f"Veri yanıtı: {data_symbols}/{len(batch)} sembol; en az 55 günlük geçmişi olan: {sufficient_history}."))
                 self.events.put(("log",f"Tarama tamamlandı: {scanned} hisse analiz edildi. Piyasa: {'açık' if clock.get('is_open') else 'kapalı'}; {'emir gönderimi mümkün' if clock.get('is_open') else 'yeni emir gönderilmedi'}."))
             except Exception as exc: self.events.put(("log","Tarama hatası: "+str(exc)))
-            self.stop.wait(900)
+            self.stop.wait(scan_interval)
         self.events.put(("log","Bot durduruldu."))
 
 class App:
@@ -180,7 +204,7 @@ class App:
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
         tk.Label(settings,text="Strateji: EMA / RSI / MACD ve basit haber kelime puanlaması; bu sürüm makine öğrenmesi modeli değildir.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
         tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz; en fazla 5 pozisyon ve işlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
-        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Her çevrimde 30 sembol taranır; tüm evrenin dolaşılması zaman alır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Son 1 yıllık günlük bar verisi kullanılır; sayfalı yanıtlar birleştirilir. Her 5 dakikada 200 sembol taranır. 13.194 sembollük evrenin tam turu yaklaşık 5,5 saat sürer. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
         for col,title,width in [("time","ZAMAN",180),("symbol","HİSSE",100),("side","YÖN",100),("qty","ADET",100),("status","DURUM",180)]:
             self.tree.heading(col,text=title); self.tree.column(col,width=width,anchor="center")
