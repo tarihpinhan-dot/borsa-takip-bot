@@ -373,6 +373,7 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
     wins = []
     losses = []
     slippage = 0.001
+    last_marked_equity = equity
     for i in range(220, len(rows)):
         signal = analyze(rows[:i])
         if not signal:
@@ -384,11 +385,12 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
         day_high = float(day["h"])
         day_low = float(day["l"])
         day_close = float(day["c"])
-        exit_price = None
-        exit_reason = ""
         closed_this_bar = False
+
         if position:
-            # Conservative same-day ambiguity: assume stop is hit before target.
+            # If both barriers are touched in one daily candle, assume the stop was hit first.
+            exit_price = None
+            exit_reason = ""
             if day_low <= position["stop"]:
                 exit_price = min(day_open, position["stop"]) * (1-slippage)
                 exit_reason = "STOP"
@@ -404,24 +406,53 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
             if exit_price is not None:
                 pnl = (exit_price-position["entry"])*position["qty"]
                 equity += pnl
-                trade = {"pnl":pnl,"entry":position["entry"],"exit":exit_price,"qty":position["qty"],"reason":exit_reason}
-                trades.append(trade)
+                trades.append({"pnl":pnl,"entry":position["entry"],"exit":exit_price,"qty":position["qty"],"reason":exit_reason})
                 (wins if pnl > 0 else losses).append(pnl)
                 position = None
                 closed_this_bar = True
-        if not position and not closed_this_bar and signal["action"] == "BUY" and market_ok:
+
+        # Peak drawdown is persistent in live mode; do not start new trades after a 5% breach.
+        drawdown_gate_open = peak <= 0 or last_marked_equity > peak*0.95
+        if not position and not closed_this_bar and signal["action"] == "BUY" and market_ok and drawdown_gate_open:
             entry = day_open * (1+slippage)
             distance = max(2.0*signal["atr"], signal["price"]*0.015)
             if distance > 0 and distance < entry*0.25:
                 qty = max(0, min(int(equity*0.0025/distance), int(equity*0.07/entry)))
                 if qty > 0:
                     position = {"entry":entry,"qty":qty,"stop":entry-distance,"target":entry+3.0*distance}
+                    # Evaluate stop/target on the entry day too; the earlier version skipped this.
+                    if day_low <= position["stop"]:
+                        exit_price = min(day_open, position["stop"]) * (1-slippage)
+                        pnl = (exit_price-position["entry"])*position["qty"]
+                        equity += pnl
+                        trades.append({"pnl":pnl,"entry":position["entry"],"exit":exit_price,"qty":position["qty"],"reason":"GİRİŞ GÜNÜ STOP"})
+                        (wins if pnl > 0 else losses).append(pnl)
+                        position = None
+                        closed_this_bar = True
+                    elif day_high >= position["target"]:
+                        exit_price = position["target"] * (1-slippage)
+                        pnl = (exit_price-position["entry"])*position["qty"]
+                        equity += pnl
+                        trades.append({"pnl":pnl,"entry":position["entry"],"exit":exit_price,"qty":position["qty"],"reason":"GİRİŞ GÜNÜ HEDEF"})
+                        (wins if pnl > 0 else losses).append(pnl)
+                        position = None
+                        closed_this_bar = True
+                    elif i == len(rows)-1:
+                        exit_price = day_close * (1-slippage)
+                        pnl = (exit_price-position["entry"])*position["qty"]
+                        equity += pnl
+                        trades.append({"pnl":pnl,"entry":position["entry"],"exit":exit_price,"qty":position["qty"],"reason":"TEST SONU"})
+                        (wins if pnl > 0 else losses).append(pnl)
+                        position = None
+                        closed_this_bar = True
+
         mark_to_market = equity
         if position:
             mark_to_market += (day_close-position["entry"])*position["qty"]
         peak = max(peak, mark_to_market)
         if peak > 0:
             max_dd = max(max_dd, (peak-mark_to_market)/peak)
+        last_marked_equity = mark_to_market
     if position:
         final_exit = float(rows[-1]["c"])*(1-slippage)
         pnl = (final_exit-position["entry"])*position["qty"]
