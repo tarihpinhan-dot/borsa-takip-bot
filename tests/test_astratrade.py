@@ -367,6 +367,27 @@ def make_intraday_bars(count=60):
 
 
 class AstraTradeIntradayTests(unittest.TestCase):
+    def test_dollar_profit_target_limit_price_rounds_up_with_cushion(self):
+        target = app.dollar_profit_limit_price(100.0, 25, 20.0)
+        self.assertIsNotNone(target)
+        self.assertGreaterEqual(target["estimated_gross_profit_usd"], 20.0)
+        self.assertGreaterEqual(target["distance"], 0.80)
+        self.assertGreater(target["buffer_usd"], 0.0)
+
+    def test_dollar_target_sizing_preserves_minimum_reward_risk(self):
+        qty = app.calculate_order_qty(
+            100000, 50000, 100.0, 0.50, 0.0, profit_target_usd=20.0
+        )
+        self.assertEqual(qty, 25)
+        self.assertLessEqual(qty * 0.50, 20.0 / 1.6 + 0.01)
+
+    def test_profit_target_reached_uses_open_position_unrealized_dollars(self):
+        self.assertFalse(app.profit_target_reached({"unrealized_pl": "19.99"}, 20.0))
+        self.assertTrue(app.profit_target_reached({"unrealized_pl": "20.00"}, 20.0))
+        self.assertTrue(app.profit_target_reached({"unrealized_pl": "25.50"}, 20.0))
+        self.assertFalse(app.profit_target_reached({"unrealized_pl": "-3.00"}, 20.0))
+        self.assertFalse(app.profit_target_reached({"unrealized_pl": "30.00"}, 0.0))
+
     def test_intraday_exit_levels_are_short_horizon_and_reject_extreme_volatility(self):
         levels = app.intraday_exit_levels(100.0, 0.20)
         self.assertAlmostEqual(levels["stop"], 99.50, places=2)
@@ -476,8 +497,12 @@ class AstraTradeIntradayTests(unittest.TestCase):
         self.assertEqual(side, "buy")
         self.assertGreater(tp, sl)
         self.assertLess((tp - sl) / sl, 0.03)
+        reference_entry = broker.intraday[-1]["c"]
+        self.assertGreaterEqual((tp - reference_entry) * qty, 20.0)
         self.assertEqual(bot.managed_protection["AAPL"]["strategy"], "intraday_v1")
         self.assertEqual(bot.managed_protection["AAPL"]["max_hold_minutes"], 45)
+        self.assertEqual(bot.managed_protection["AAPL"]["profit_target_usd"], 20.0)
+        self.assertGreaterEqual(bot.managed_protection["AAPL"]["estimated_target_profit_usd"], 20.0)
 
     def test_intraday_bars_requests_5_minute_iex_data(self):
         broker = app.Alpaca("paper-key", "paper-secret")
