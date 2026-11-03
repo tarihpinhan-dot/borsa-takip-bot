@@ -490,7 +490,10 @@ def aggregate_15m(rows):
     result = []
     for bucket in sorted(grouped):
         items = sorted(grouped[bucket], key=lambda item: _parse_utc(item.get("t")))
-        if len(items) < 2:
+        # A 15-minute candle is usable only after its third 5-minute interval has closed.
+        bucket_end = datetime.fromtimestamp(bucket + 900, timezone.utc)
+        last_five_minute_end = _parse_utc(items[-1].get("t")) + timedelta(minutes=5)
+        if len(items) < 2 or last_five_minute_end < bucket_end:
             continue
         result.append({
             "t": datetime.fromtimestamp(bucket, timezone.utc).isoformat(),
