@@ -365,8 +365,11 @@ def is_eligible_common_stock(asset):
         and not excluded
     )
 
-def calculate_order_qty(equity, available_cash, price, stop_distance, managed_exposure):
-    """Return integer shares while enforcing risk, per-position, exposure and cash caps."""
+def calculate_order_qty(
+    equity, available_cash, price, stop_distance, managed_exposure,
+    profit_target_usd=None, min_reward_risk=1.6
+):
+    """Size shares against risk, capital, exposure and optional USD-target reward/risk."""
     equity = max(0.0, float(equity))
     available_cash = max(0.0, float(available_cash))
     price = float(price)
@@ -380,7 +383,45 @@ def calculate_order_qty(equity, available_cash, price, stop_distance, managed_ex
     qty_by_position = int(equity * 0.07 / price)
     qty_by_exposure = int(exposure_room / price)
     qty_by_cash = int(available_cash * 0.98 / price)
-    return max(0, min(qty_by_risk, qty_by_position, qty_by_exposure, qty_by_cash))
+    limits = [qty_by_risk, qty_by_position, qty_by_exposure, qty_by_cash]
+    if profit_target_usd is not None:
+        profit_target_usd = float(profit_target_usd)
+        min_reward_risk = float(min_reward_risk)
+        if profit_target_usd <= 0 or min_reward_risk <= 0:
+            return 0
+        limits.append(int(profit_target_usd / (stop_distance * min_reward_risk)))
+    return max(0, min(limits))
+
+
+def dollar_profit_limit_price(entry_price, qty, profit_target_usd, buffer_rate=0.001):
+    """Round a sell limit up so its estimated gross P/L includes a small fill-price cushion."""
+    entry_price = float(entry_price)
+    qty = int(qty)
+    profit_target_usd = float(profit_target_usd)
+    buffer_rate = max(0.0, float(buffer_rate))
+    if entry_price <= 0 or qty <= 0 or profit_target_usd <= 0:
+        return None
+    buffer_usd = max(0.50, entry_price * qty * buffer_rate)
+    target_usd_with_buffer = profit_target_usd + buffer_usd
+    raw_target = entry_price + target_usd_with_buffer / qty
+    target_price = math.ceil(raw_target * 100 - 1e-8) / 100
+    target_price = round(target_price, 2)
+    return {
+        "price": target_price,
+        "distance": target_price - entry_price,
+        "estimated_gross_profit_usd": (target_price - entry_price) * qty,
+        "buffer_usd": buffer_usd
+    }
+
+
+def profit_target_reached(position, target_usd):
+    """True when Alpaca reports at least the configured unrealized USD profit on a position."""
+    try:
+        pnl = float(position.get("unrealized_pl", 0) or 0)
+        target = float(target_usd)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return target > 0 and pnl >= target
 
 def analyze(rows):
     # Long-only daily swing strategy; all indicators use the same price series.
@@ -889,10 +930,11 @@ def news_score(items):
     return {sym:sum(vals)/len(vals) for sym,vals in scores.items()}
 
 class Bot:
-    def __init__(self, broker, events, stop):
+    def __init__(self, broker, events, stop, profit_target_usd=20.0):
         self.broker = broker
         self.events = events
         self.stop = stop
+        self.profit_target_usd = float(profit_target_usd)
         self.managed_symbols = load_managed_symbols()
         self.managed_groups = load_managed_groups()
         self.managed_protection = load_managed_protection()
@@ -1349,6 +1391,17 @@ class Bot:
                 for symbol in sorted(set(held) & self.managed_symbols):
                     meta = self.managed_protection.get(symbol, {})
                     if meta.get("strategy") != "intraday_v1" or symbol in pending_market_sell_symbols:
+                        continue
+                    position = held.get(symbol, {})
+                    position_target = float(meta.get("profit_target_usd", self.profit_target_usd) or self.profit_target_usd)
+                    current_pnl = float(position.get("unrealized_pl", 0) or 0)
+                    if profit_target_reached(position, position_target):
+                        self.events.put((
+                            "log",
+                            f"DOLAR KÂR HEDEFİ {symbol}: gerçekleşmemiş K/Z USD {current_pnl:+.2f} >= USD {position_target:.2f}; pozisyon kapatılıyor."
+                        ))
+                        if self._close_managed_position(symbol, open_orders):
+                            pending_market_sell_symbols.add(symbol)
                         continue
                     opened_at = meta.get("opened_at")
                     try:
