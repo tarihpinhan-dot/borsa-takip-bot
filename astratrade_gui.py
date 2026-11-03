@@ -980,7 +980,7 @@ class App:
         self.chart_status.configure(text=f"{symbol} verisi yükleniyor...")
         def work():
             try:
-                rows=self.broker.history(symbol,timeframe,days)
+                rows=self.broker.history(symbol,timeframe,days,adjustment="split")
                 if not rows: raise RuntimeError("Bu sembol için IEX akışında grafik verisi bulunamadı.")
                 self.events.put(("chart",(symbol,rows,timeframe)))
             except Exception as exc:
