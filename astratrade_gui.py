@@ -11,6 +11,25 @@ NEG = {"miss","downgrade","plunge","loss","warning","warns","cuts","fraud","prob
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "AstraTradeAI")
 os.makedirs(APP_DIR, exist_ok=True)
 LOG_FILE = os.path.join(APP_DIR, "astratrade.log")
+STATE_FILE = os.path.join(APP_DIR, "bot_state.json")
+MAX_MANAGED_POSITIONS = 5
+
+def load_managed_symbols():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        values = data.get("managed_symbols", [])
+        return {str(x).upper() for x in values if isinstance(x, str) and x.strip()}
+    except FileNotFoundError:
+        return set()
+    except Exception:
+        return set()
+
+def save_managed_symbols(symbols):
+    temp_file = STATE_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump({"managed_symbols": sorted(set(symbols))}, f, indent=2)
+    os.replace(temp_file, STATE_FILE)
 
 def logline(msg):
     line = datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ") + str(msg)
@@ -112,7 +131,11 @@ def news_score(items):
     return {sym:sum(vals)/len(vals) for sym,vals in scores.items()}
 
 class Bot:
-    def __init__(self, broker, events, stop): self.broker=broker; self.events=events; self.stop=stop
+    def __init__(self, broker, events, stop):
+        self.broker=broker
+        self.events=events
+        self.stop=stop
+        self.managed_symbols=load_managed_symbols()
     def run(self):
         self.broker.account()
         assets=self.broker.assets()
@@ -151,7 +174,16 @@ class Bot:
                 open_orders=self.broker.open_orders()
                 pending={o["symbol"] for o in open_orders}
                 pending_buys={o["symbol"] for o in open_orders if str(o.get("side","")).lower()=="buy"}
-                reserved=set(held) | pending_buys
+                # Only count positions opened by this AstraTrade installation toward
+                # its five-position strategy limit. Older/manual positions remain
+                # protected and are never sold by this bot.
+                active_symbols=set(held) | pending
+                self.managed_symbols.intersection_update(active_symbols)
+                save_managed_symbols(self.managed_symbols)
+                managed_active=set(self.managed_symbols)
+                reserved=set(held) | pending
+                external_positions=set(held) - managed_active
+                self.events.put(("log",f"Hesap pozisyonları: {len(held)} toplam; AstraTrade tarafından yönetilen: {len(managed_active)}/{MAX_MANAGED_POSITIONS}; eski/harici pozisyon: {len(external_positions)}."))
                 account=self.broker.account(); clock=self.broker.call(PAPER,"/v2/clock")
                 equity=float(account["equity"]); cash=float(account.get("cash",0))
                 last=float(account.get("last_equity",equity))
@@ -170,7 +202,7 @@ class Bot:
                     scanned+=1
                     self.events.put(("decision",(sym,action,score,f["price"],f["rsi"])))
                     if not clock.get("is_open") or sym in pending: continue
-                    if action=="BUY" and sym not in reserved and len(reserved)<5 and daily>-.02:
+                    if action=="BUY" and sym not in reserved and len(managed_active)<MAX_MANAGED_POSITIONS and daily>-.02:
                         distance=max(1.5*f["atr"],f["price"]*.01)
                         if distance >= f["price"]*.80:
                             continue
@@ -182,10 +214,13 @@ class Bot:
                             pending.add(sym)
                             pending_buys.add(sym)
                             reserved.add(sym)
+                            managed_active.add(sym)
+                            self.managed_symbols.add(sym)
+                            save_managed_symbols(self.managed_symbols)
                             held[sym]={"symbol":sym,"qty":str(qty)}
                             cash=max(0.0,cash-qty*f["price"])
-                            self.events.put(("log",f"SANAL ALIM {sym} x{qty} | skor {score:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
-                    elif action=="SELL" and sym in held:
+                            self.events.put(("log",f"ASTRATRADE SANAL ALIM {sym} x{qty} | skor {score:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
+                    elif action=="SELL" and sym in held and sym in self.managed_symbols:
                         qty=abs(float(held[sym]["qty"]))
                         if qty:
                             result=self.broker.order(sym,qty,"sell"); pending.add(sym)
@@ -237,7 +272,7 @@ class App:
         self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
         tk.Label(settings,text="Strateji: EMA / RSI / MACD ve basit haber kelime puanlaması; bu sürüm makine öğrenmesi modeli değildir.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
-        tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz. Açık pozisyonlar ve bekleyen alış emirleri birlikte en fazla 5 ile sınırlandırılır; işlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz. AstraTrade bu kurulumda yalnızca kendi açtığı pozisyonları yönetir; eski botlardan/manual hesaptan gelen pozisyonları otomatik satmaz ve kendi 5 pozisyon sınırına saymaz. İşlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Tarama evreni yalnızca adı Common Stock / Common Shares olan aktif NYSE, NASDAQ ve NYSE American adi hisseleridir. ETF, kaldıraçlı/ters fon, varant, imtiyazlı pay, birim ve tahvil benzeri varlıklar dışarıda bırakılır. Alış için ayrıca 20 günlük ortalama günlük dolar hacmi en az 5 milyon USD olmalıdır. Her 5 dakikada 200 sembol taranır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
         for col,title,width in [("time","ZAMAN",180),("symbol","HİSSE",100),("side","YÖN",100),("qty","ADET",100),("status","DURUM",180)]:
