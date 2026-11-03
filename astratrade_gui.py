@@ -377,7 +377,11 @@ class App:
     def __init__(self, root):
         self.root=root; root.title("AstraTrade AI"); root.geometry("950x650"); root.configure(bg="#111827")
         self.events=queue.Queue(); self.stop_event=threading.Event(); self.thread=None; self.broker=None
-        self.build(); root.after(250,self.poll); root.protocol("WM_DELETE_WINDOW",self.close)
+        self.build()
+        saved_key, saved_secret = load_credentials()
+        if saved_key: self.key.insert(0, saved_key)
+        if saved_secret: self.secret.insert(0, saved_secret)
+        root.after(250,self.poll); root.protocol("WM_DELETE_WINDOW",self.close)
     def build(self):
         bg="#111827"; panel="#1f2d42"; green="#36c99a"
         head=tk.Frame(self.root,bg=bg); head.pack(fill="x",padx=20,pady=18)
@@ -385,8 +389,9 @@ class App:
         tk.Label(head,text="US EQUITIES • PAPER ONLY • RULE-BASED",bg=bg,fg=green).pack(side="left",padx=15)
         self.connection=tk.Label(head,text="● BAĞLI DEĞİL",bg=bg,fg="#ffc36d"); self.connection.pack(side="right")
         tabs=ttk.Notebook(self.root); tabs.pack(fill="both",expand=True,padx=20,pady=(0,15)); self.tabs=tabs
-        home=tk.Frame(tabs,bg=bg); settings=tk.Frame(tabs,bg=bg); history=tk.Frame(tabs,bg=bg)
-        tabs.add(home,text="Kontrol Paneli"); tabs.add(settings,text="Alpaca Bağlantısı"); tabs.add(history,text="İşlemler"); self.settings=settings
+        home=tk.Frame(tabs,bg=bg); settings=tk.Frame(tabs,bg=bg); history=tk.Frame(tabs,bg=bg); chart=tk.Frame(tabs,bg=bg)
+        tabs.add(home,text="Genel Bakış"); tabs.add(chart,text="Piyasa Grafiği"); tabs.add(history,text="Emirler"); tabs.add(settings,text="Bağlantı ve Risk"); self.settings=settings
+        self.chart_page=chart
         self.metrics={}
         row=tk.Frame(home,bg=bg); row.pack(fill="x",pady=15)
         for key,title in [("equity","SANAL HESAP"),("cash","NAKİT"),("positions","AÇIK POZİSYON")]:
@@ -397,24 +402,144 @@ class App:
         tk.Label(bar,text="Otomatik sanal işlem",bg=panel,fg="white").pack(side="left")
         self.start_button=tk.Button(bar,text="BOTU BAŞLAT",command=self.start,bg=green,fg="#07131a",relief="flat",padx=18,pady=9); self.start_button.pack(side="right")
         self.stop_button=tk.Button(bar,text="DURDUR",command=self.stop_bot,bg="#a13e4a",fg="white",relief="flat",padx=18,pady=9,state="disabled"); self.stop_button.pack(side="right",padx=8)
+        tk.Button(home,text="HESABI / GRAFİĞİ YENİLE",command=self.refresh_portfolio,bg="#26364d",fg="white",relief="flat").pack(anchor="e",pady=(0,5))
         self.market=tk.Label(home,text="Piyasa: — | Tarama evreni: —",bg=bg,fg="#9caec1"); self.market.pack(anchor="w")
-        tk.Label(home,text="BOT FAALİYETLERİ",bg=bg,fg="white").pack(anchor="w",pady=(10,3))
-        self.log=tk.Text(home,bg="#090f1a",fg="#dbe5ef",font=("Consolas",9),relief="flat"); self.log.pack(fill="both",expand=True)
+        self.portfolio_canvas=tk.Canvas(home,bg="#0b1220",height=190,highlightthickness=0); self.portfolio_canvas.pack(fill="x",pady=8)
+        tk.Label(home,text="BOT FAALİYETLERİ",bg=bg,fg="white").pack(anchor="w",pady=(4,3))
+        self.log=tk.Text(home,bg="#090f1a",fg="#dbe5ef",font=("Consolas",9),relief="flat",height=8); self.log.pack(fill="both",expand=True)
         box=tk.Frame(settings,bg=panel,padx=22,pady=22); box.pack(fill="x",padx=18,pady=18)
         tk.Label(box,text="Alpaca Paper Trading",bg=panel,fg="white",font=("Segoe UI",15,"bold")).pack(anchor="w")
         tk.Label(box,text="YALNIZCA Paper API anahtarlarını gir. Gerçek hesap anahtarlarını kullanma.",bg=panel,fg="#ffc36d").pack(anchor="w",pady=12)
         tk.Label(box,text="Paper API Key",bg=panel,fg="white").pack(anchor="w"); self.key=tk.Entry(box,font=("Consolas",10)); self.key.pack(fill="x",pady=5)
         tk.Label(box,text="Paper Secret Key",bg=panel,fg="white").pack(anchor="w"); self.secret=tk.Entry(box,show="*",font=("Consolas",10)); self.secret.pack(fill="x",pady=5)
-        self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
+        self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET VE GÜVENLİ KAYDET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
+        tk.Label(box,text="Başarılı bağlantıdan sonra anahtarlar Windows hesabına bağlı DPAPI şifrelemesiyle bu bilgisayarda saklanır ve sonraki açılışta otomatik yüklenir.",bg=panel,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",pady=4)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
-        tk.Label(settings,text="Strateji: EMA / RSI / MACD ve basit haber kelime puanlaması; bu sürüm makine öğrenmesi modeli değildir.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
-        tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz. AstraTrade bu kurulumda yalnızca kendi açtığı pozisyonları yönetir; eski botlardan/manual hesaptan gelen pozisyonları otomatik satmaz ve kendi 5 pozisyon sınırına saymaz. İşlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="STRATEJİ: SMA200 uzun trend filtresi, EMA20/50 sıralaması, tutarlı MACD, RSI 50–68, 20 günlük tepe kırılımı ve hacim onayı. Ayrıca SPY piyasa rejimi kontrol edilir. Sistem makine öğrenmesi değildir ve kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
+        tk.Label(settings,text="Her alışta 2 ATR veya %1,5 asgari stop mesafesi ve 3R hedefli bracket emir kullanılır. İşlem başına özkaynağın %0,25’i, tek pozisyonda %7’si, AstraTrade pozisyonlarının toplamında %30’u aşılmaz. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alışlar kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlar satılmaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Tarama evreni yalnızca adı Common Stock / Common Shares olan aktif NYSE, NASDAQ ve NYSE American adi hisseleridir. ETF, kaldıraçlı/ters fon, varant, imtiyazlı pay, birim ve tahvil benzeri varlıklar dışarıda bırakılır. Alış için ayrıca 20 günlük ortalama günlük dolar hacmi en az 5 milyon USD olmalıdır. Her 5 dakikada 200 sembol taranır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        # Midas benzeri mum grafiği: fiyat, EMA20/50 ve hacim.
+        chart_controls=tk.Frame(chart,bg=bg,padx=15,pady=12); chart_controls.pack(fill="x")
+        tk.Label(chart_controls,text="Hisse kodu",bg=bg,fg="white").pack(side="left")
+        self.chart_symbol=tk.Entry(chart_controls,width=12,font=("Segoe UI",11)); self.chart_symbol.insert(0,"AAPL"); self.chart_symbol.pack(side="left",padx=6)
+        tk.Label(chart_controls,text="Zaman aralığı",bg=bg,fg="white").pack(side="left",padx=(12,4))
+        self.chart_tf=ttk.Combobox(chart_controls,state="readonly",width=12,values=["Günlük","Saatlik","15 Dakika","5 Dakika"]); self.chart_tf.set("Günlük"); self.chart_tf.pack(side="left")
+        tk.Button(chart_controls,text="GRAFİĞİ GETİR",command=self.load_chart,bg=green,fg="#07131a",relief="flat",padx=14,pady=7).pack(side="left",padx=10)
+        self.chart_status=tk.Label(chart,text="Grafik için Alpaca Paper hesabına bağlan ve hisse kodunu getir.",bg=bg,fg="#9caec1"); self.chart_status.pack(anchor="w",padx=18)
+        self.price_canvas=tk.Canvas(chart,bg="#0b1220",highlightthickness=0); self.price_canvas.pack(fill="both",expand=True,padx=12,pady=12)
+        self.price_canvas.bind("<Configure>",lambda e:self.draw_price_chart())
+        self.chart_rows=[]; self.chart_name=""; self.chart_timeframe="1Day"
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
         for col,title,width in [("time","ZAMAN",180),("symbol","HİSSE",100),("side","YÖN",100),("qty","ADET",100),("status","DURUM",180)]:
             self.tree.heading(col,text=title); self.tree.column(col,width=width,anchor="center")
         self.tree.pack(fill="both",expand=True,padx=15,pady=15)
         tk.Button(history,text="İŞLEMLERİ YENİLE",command=self.refresh_history).pack(anchor="e",padx=15,pady=10)
+    def refresh_portfolio(self):
+        if not self.broker:
+            return
+        def work():
+            try:
+                data=self.broker.portfolio_history()
+                self.events.put(("portfolio",data))
+            except Exception as exc:
+                self.events.put(("log","Portföy grafiği alınamadı: "+str(exc)))
+        threading.Thread(target=work,daemon=True).start()
+
+    def draw_portfolio_history(self,data):
+        canvas=self.portfolio_canvas
+        canvas.delete("all")
+        values=[float(x) for x in data.get("equity",[]) if x not in (None,"NaN")]
+        if len(values)<2:
+            canvas.create_text(18,20,anchor="nw",fill="#9caec1",text="Portföy performans grafiği için henüz yeterli veri yok.")
+            return
+        w=max(canvas.winfo_width(),600); h=max(canvas.winfo_height(),170)
+        left,right,top,bottom=72,w-24,18,h-28
+        low,high=min(values),max(values)
+        if high==low: high=low+1
+        canvas.create_text(left,8,anchor="nw",fill="#9caec1",text="PORTFÖY ÖZKAYNAK GELİŞİMİ • SON 1 AY")
+        for k in range(4):
+            y=top+(bottom-top)*k/3
+            val=high-(high-low)*k/3
+            canvas.create_line(left,y,right,y,fill="#243247")
+            canvas.create_text(left-8,y,anchor="e",fill="#8294aa",text=f"\${val:,.0f}",font=("Segoe UI",8))
+        pts=[]
+        for i,val in enumerate(values):
+            x=left+(right-left)*i/max(1,len(values)-1)
+            y=bottom-(val-low)/(high-low)*(bottom-top)
+            pts.extend([x,y])
+        if len(pts)>=4: canvas.create_line(*pts,fill="#36c99a",width=2,smooth=True)
+        canvas.create_text(right,bottom+6,anchor="ne",fill="#9caec1",text=f"Son: USD {values[-1]:,.2f}",font=("Segoe UI",9,"bold"))
+
+    def load_chart(self):
+        if not self.broker:
+            messagebox.showinfo("Bağlantı","Önce Alpaca Paper bağlantısını test et.")
+            return
+        symbol=self.chart_symbol.get().strip().upper()
+        if not symbol or not symbol.isalnum():
+            messagebox.showwarning("Hisse kodu","Geçerli bir hisse kodu gir.")
+            return
+        choice=self.chart_tf.get()
+        mapping={"Günlük":("1Day",365),"Saatlik":("1Hour",30),"15 Dakika":("15Min",7),"5 Dakika":("5Min",2)}
+        timeframe,days=mapping.get(choice,("1Day",365))
+        self.chart_status.configure(text=f"{symbol} verisi yükleniyor...")
+        def work():
+            try:
+                rows=self.broker.history(symbol,timeframe,days)
+                if not rows: raise RuntimeError("Bu sembol için IEX akışında grafik verisi bulunamadı.")
+                self.events.put(("chart",(symbol,rows,timeframe)))
+            except Exception as exc:
+                self.events.put(("log","Grafik hatası: "+str(exc)))
+                self.events.put(("chart_error",str(exc)))
+        threading.Thread(target=work,daemon=True).start()
+
+    def draw_price_chart(self):
+        if not hasattr(self,"price_canvas"):
+            return
+        canvas=self.price_canvas
+        canvas.delete("all")
+        rows=self.chart_rows[-120:]
+        if len(rows)<2:
+            canvas.create_text(22,22,anchor="nw",fill="#9caec1",text="Grafik verisi bekleniyor. Hisse kodu girip GRAFİĞİ GETİR'e bas.")
+            return
+        w=max(canvas.winfo_width(),620); h=max(canvas.winfo_height(),360)
+        left,right,top,bottom=68,w-22,42,h-62
+        volume_top=bottom-(bottom-top)*0.20
+        highs=[float(x["h"]) for x in rows]; lows=[float(x["l"]) for x in rows]
+        opens=[float(x["o"]) for x in rows]; closes=[float(x["c"]) for x in rows]
+        volumes=[float(x.get("v",0) or 0) for x in rows]
+        upper=max(highs); lower=min(lows); pad=(upper-lower)*0.07 or max(upper*0.01,0.1)
+        upper+=pad; lower-=pad
+        def py(v): return top+(upper-v)/(upper-lower)*(volume_top-top)
+        canvas.create_text(left,12,anchor="nw",fill="#e6edf7",text=f"{self.chart_name}  \${closes[-1]:,.2f}  |  Mum + EMA20 / EMA50 + Hacim",font=("Segoe UI",11,"bold"))
+        for k in range(5):
+            val=upper-(upper-lower)*k/4
+            y=py(val)
+            canvas.create_line(left,y,right,y,fill="#243247")
+            canvas.create_text(left-8,y,anchor="e",fill="#8ea0b6",text=f"{val:.2f}",font=("Segoe UI",8))
+        max_vol=max(volumes) or 1
+        n=len(rows); step=(right-left)/n; candle=max(2,min(9,step*0.62))
+        ema20=ema_series(closes,20); ema50=ema_series(closes,50)
+        for i,row in enumerate(rows):
+            x=left+(i+0.5)*step
+            color="#31c48d" if closes[i]>=opens[i] else "#ef6b73"
+            canvas.create_line(x,py(highs[i]),x,py(lows[i]),fill=color,width=1)
+            y1=py(max(opens[i],closes[i])); y2=py(min(opens[i],closes[i]))
+            if y2-y1<1: y2=y1+1
+            canvas.create_rectangle(x-candle/2,y1,x+candle/2,y2,fill=color,outline=color)
+            vy=bottom-(volumes[i]/max_vol)*(bottom-volume_top)
+            canvas.create_rectangle(x-candle/2,vy,x+candle/2,bottom,fill="#263d55",outline="")
+        for vals,color in ((ema20,"#f6c85f"),(ema50,"#7aa2f7")):
+            points=[]
+            for i,val in enumerate(vals):
+                x=left+(i+0.5)*step
+                points.extend([x,py(val)])
+            if len(points)>=4: canvas.create_line(*points,fill=color,width=1.5)
+        canvas.create_text(left,volume_top+4,anchor="nw",fill="#8ea0b6",text="HACİM",font=("Segoe UI",8))
+        canvas.create_text(left,bottom+8,anchor="nw",fill="#8ea0b6",text=str(rows[0].get("t",""))[:10],font=("Segoe UI",8))
+        canvas.create_text(right,bottom+8,anchor="ne",fill="#8ea0b6",text=str(rows[-1].get("t",""))[:10],font=("Segoe UI",8))
+        canvas.create_text(right,top+3,anchor="ne",fill="#f6c85f",text="EMA20",font=("Segoe UI",8))
+        canvas.create_text(right,top+17,anchor="ne",fill="#7aa2f7",text="EMA50",font=("Segoe UI",8))
+
     def add_log(self,msg):
         line=logline(msg); self.log.insert("end",line+"\n"); self.log.see("end")
     def test_connection(self):
@@ -423,16 +548,24 @@ class App:
         self.test_button.configure(state="disabled")
         def work():
             try:
-                broker=Alpaca(key,secret); account=broker.account(); self.events.put(("connected",(broker,account)))
+                broker=Alpaca(key,secret); account=broker.account(); saved=False
+                try:
+                    save_credentials(key,secret); saved=True
+                except Exception as save_error:
+                    self.events.put(("log","API bilgileri güvenli kaydedilemedi: "+str(save_error)))
+                self.events.put(("connected",(broker,account,saved)))
             except Exception as exc: self.events.put(("error",str(exc)))
         threading.Thread(target=work,daemon=True).start()
     def start(self):
         if not self.key.get().strip() or not self.secret.get().strip():
             self.tabs.select(self.settings); messagebox.showwarning("Bağlantı","Önce Paper API bilgilerini gir."); return
         if self.thread and self.thread.is_alive(): return
-        self.broker=Alpaca(self.key.get().strip(),self.secret.get().strip()); self.stop_event.clear()
+        self.broker=Alpaca(self.key.get().strip(),self.secret.get().strip())
+        try: save_credentials(self.key.get().strip(),self.secret.get().strip())
+        except Exception as exc: self.add_log("API bilgileri kaydedilemedi: "+str(exc))
+        self.stop_event.clear()
         bot=Bot(self.broker,self.events,self.stop_event); self.thread=threading.Thread(target=self.run,args=(bot,),daemon=True); self.thread.start()
-        self.start_button.configure(state="disabled"); self.stop_button.configure(state="normal"); self.connection.configure(text="● BOT ÇALIŞIYOR",fg=green)
+        self.start_button.configure(state="disabled"); self.stop_button.configure(state="normal"); self.connection.configure(text="● BOT ÇALIŞIYOR",fg="#36c99a")
     def run(self,bot):
         try: bot.run()
         except Exception as exc: self.events.put(("fatal",str(exc)))
@@ -443,11 +576,17 @@ class App:
             while True:
                 kind,value=self.events.get_nowait()
                 if kind=="log": self.add_log(value)
+                elif kind=="portfolio": self.draw_portfolio_history(value)
+                elif kind=="chart_error": self.chart_status.configure(text="Grafik yüklenemedi: "+value)
+                elif kind=="chart":
+                    self.chart_name,self.chart_rows,self.chart_timeframe=value
+                    self.chart_status.configure(text=f"{self.chart_name} | {len(self.chart_rows)} mum | {self.chart_timeframe} | IEX veri akışı")
+                    self.draw_price_chart()
                 elif kind=="connected":
-                    self.broker,account=value; self.connection.configure(text="● ALPACA PAPER BAĞLI",fg="#36c99a")
-                    self.result.configure(text=f"Bağlantı başarılı | Hesap: {account.get('status')} | Sanal bakiye: USD {float(account.get('equity',0)):,.2f}",fg="#36c99a")
+                    self.broker,account,saved=value; self.connection.configure(text="● ALPACA PAPER BAĞLI",fg="#36c99a")
+                    self.result.configure(text=f"Bağlantı başarılı | Hesap: {account.get('status')} | Sanal bakiye: USD {float(account.get('equity',0)):,.2f} | API: {'GÜVENLİ KAYDEDİLDİ' if saved else 'KAYDEDİLEMEDİ'}",fg="#36c99a" if saved else "#ffc36d")
                     self.metrics["equity"].configure(text=f"USD {float(account.get('equity',0)):,.2f}"); self.metrics["cash"].configure(text=f"USD {float(account.get('cash',0)):,.2f}")
-                    self.test_button.configure(state="normal"); self.add_log("Alpaca Paper bağlantısı doğrulandı.")
+                    self.test_button.configure(state="normal"); self.add_log("Alpaca Paper bağlantısı doğrulandı." if saved else "Bağlantı doğrulandı ancak API anahtarları güvenli kaydedilemedi."); self.refresh_portfolio()
                 elif kind=="error":
                     self.result.configure(text="Bağlantı hatası: "+value,fg="#ff7373"); self.test_button.configure(state="normal"); messagebox.showerror("Alpaca",value)
                 elif kind=="decision":
