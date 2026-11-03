@@ -27,11 +27,12 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Record successful build metadata
+      - name: Record build metadata
+        if: always()
         shell: pwsh
         run: |
           $status = [ordered]@{
-            status = "success"
+            status = "${{ job.status }}"
             workflow_run_id = "${{ github.run_id }}"
             run_attempt = "${{ github.run_attempt }}"
             source_commit = "${{ github.sha }}"
@@ -45,6 +46,6 @@ jobs:
           git add build-status.json
           git diff --cached --quiet
           if ($LASTEXITCODE -ne 0) {
-            git commit -m "Record successful AstraTrade Windows build"
+            git commit -m "Record AstraTrade Windows build status"
             git push
           }
