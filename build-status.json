@@ -1,9 +1,9 @@
 {
   "status": "success",
-  "workflow_run_id": "41705101155",
+  "workflow_run_id": "41705511572",
   "run_attempt": "1",
-  "source_commit": "ee77a7b099b6b015f19256b40ad7b0103192fdb3",
-  "branch": "ci/verify-usd-profit-target",
+  "source_commit": "55edc5e73b2f35c2b7940e41fcf91be6f6e821f8",
+  "branch": "main",
   "artifact_name": "AstraTradeAI-Windows",
-  "recorded_at_utc": "2026-11-03T19:39:11.8671038Z"
+  "recorded_at_utc": "2026-11-03T19:41:58.4554523Z"
 }
