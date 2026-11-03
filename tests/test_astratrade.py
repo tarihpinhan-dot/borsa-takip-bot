@@ -183,7 +183,7 @@ class AstraTradeCoreTests(unittest.TestCase):
                 return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
             def assets(self):
                 return [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "status": "active", "tradable": True}]
-            def bars(self, symbols):
+            def bars(self, symbols, progress_callback=None):
                 return {"bars": {symbol: self.rows for symbol in symbols}}
             def clock(self):
                 return {"is_open": True, "timestamp": "2026-11-03T16:00:00Z"}
@@ -241,7 +241,7 @@ class AstraTradeCoreTests(unittest.TestCase):
                 return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
             def assets(self):
                 return [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "status": "active", "tradable": True}]
-            def bars(self, symbols):
+            def bars(self, symbols, progress_callback=None):
                 return {"bars": {symbol: self.rows for symbol in symbols}}
             def clock(self):
                 return {"is_open": False, "timestamp": "2026-11-03T16:00:00Z"}
@@ -474,7 +474,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
                     "symbol": "AAPL", "name": "Apple Inc. Common Stock",
                     "exchange": "NASDAQ", "status": "active", "tradable": True
                 }]
-            def bars(self, symbols):
+            def bars(self, symbols, progress_callback=None):
                 return {"bars": {symbol: (self.daily if symbol in ("AAPL", "SPY") else []) for symbol in symbols}}
             def intraday_bars(self, symbols, days=5):
                 return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
@@ -544,7 +544,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
                     "symbol": "AAPL", "name": "Apple Inc. Common Stock",
                     "exchange": "NASDAQ", "status": "active", "tradable": True
                 }]
-            def bars(self, symbols):
+            def bars(self, symbols, progress_callback=None):
                 return {"bars": {symbol: self.daily for symbol in symbols if symbol in ("AAPL", "SPY")}}
             def intraday_bars(self, symbols, days=5):
                 return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
@@ -590,6 +590,49 @@ class AstraTradeIntradayTests(unittest.TestCase):
         self.assertEqual(params["feed"], "iex")
         self.assertEqual(params["limit"], 10000)
 
+
+
+    def test_daily_bars_retries_read_timeout_and_reports_retry(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        expected = {"bars": {"AAPL": make_bars(3)}}
+        progress = []
+        with patch.object(
+            broker, "call",
+            side_effect=[TimeoutError("The read operation timed out"), expected]
+        ) as mocked, patch.object(app.time, "sleep"):
+            result = broker.bars(["AAPL"], progress_callback=progress.append)
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(result["bars"]["AAPL"], expected["bars"]["AAPL"])
+        self.assertEqual(result["failed_symbols"], [])
+        self.assertTrue(any("yeniden deneme" in message for message in progress))
+
+    def test_daily_bars_splits_timed_out_large_group_and_keeps_all_successful_data(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        symbols = [f"SYM{i:02d}" for i in range(20)]
+        call_sizes = []
+        def fake_call(base, path, params):
+            requested = params["symbols"].split(",")
+            call_sizes.append(len(requested))
+            if len(requested) > 10:
+                raise TimeoutError("The read operation timed out")
+            return {"bars": {symbol: make_bars(3) for symbol in requested}}
+        progress = []
+        with patch.object(broker, "call", side_effect=fake_call), patch.object(app.time, "sleep"):
+            result = broker.bars(symbols, progress_callback=progress.append)
+        self.assertEqual(set(result["bars"]), set(symbols))
+        self.assertEqual(result["failed_symbols"], [])
+        self.assertEqual(call_sizes, [20, 20, 20, 10, 10])
+        self.assertTrue(any("iki gruba ayrılıyor" in message for message in progress))
+        self.assertTrue(any("20/20 sembol tamamlandı" in message for message in progress))
+
+    def test_daily_bars_does_not_retry_non_transient_http_errors(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        with patch.object(
+            broker, "call", side_effect=RuntimeError("Alpaca HTTP 400: invalid request")
+        ) as mocked, patch.object(app.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+                broker.bars(["AAPL"])
+        self.assertEqual(mocked.call_count, 1)
 
 
 if __name__ == "__main__":
