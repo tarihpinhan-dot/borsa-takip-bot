@@ -1,6 +1,10 @@
 name: AstraTrade AI Windows EXE
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'astratrade_gui.py'
+      - '.github/workflows/astratrade-ai-windows.yml'
 permissions:
   contents: read
 jobs:
@@ -17,3 +21,5 @@ jobs:
         with:
           name: AstraTradeAI-Windows
           path: dist/AstraTradeAI.exe
+          if-no-files-found: error
+          retention-days: 30
