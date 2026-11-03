@@ -85,6 +85,12 @@ class AstraTradeCoreTests(unittest.TestCase):
         self.assertEqual(current_price, rows[-1]["c"])
         self.assertFalse(fresh)
 
+    def test_live_entry_confirmation_rejects_failed_breakout_and_chasing(self):
+        signal = {"price": 100.0, "ema20": 98.0, "prior_20_high": 99.0, "atr": 4.0}
+        self.assertTrue(app.confirm_live_entry(signal, 101.0))
+        self.assertFalse(app.confirm_live_entry(signal, 98.0))
+        self.assertFalse(app.confirm_live_entry(signal, 107.0))
+
     def test_common_stock_filter_excludes_funds_and_non_common_assets(self):
         base = {"symbol": "ABC", "tradable": True, "status": "active", "exchange": "NASDAQ"}
         self.assertTrue(app.is_eligible_common_stock({**base, "name": "ABC Class A Common Stock"}))
@@ -154,7 +160,7 @@ class AstraTradeCoreTests(unittest.TestCase):
             })
         signal = {
             "price": 100.0, "sma200": 90.0, "ema50": 95.0,
-            "atr": 5.0, "action": "BUY"
+            "atr": 5.0, "ema20": 95.0, "prior_20_high": 99.0, "action": "BUY"
         }
         with patch.object(app, "analyze", return_value=signal):
             result = app.backtest_strategy(rows, rows)
