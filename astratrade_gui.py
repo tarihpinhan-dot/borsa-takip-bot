@@ -144,7 +144,30 @@ class Alpaca:
     def assets(self): return self.call(PAPER, "/v2/assets", {"status":"active","asset_class":"us_equity"})
     def positions(self): return self.call(PAPER, "/v2/positions")
     def clock(self): return self.call(PAPER, "/v2/clock")
-    def open_orders(self): return self.call(PAPER, "/v2/orders", {"status":"open","limit":500})
+    def open_orders(self):
+        # Alpaca caps one order-list response at 500. Fetch all open orders so
+        # position ownership and protective OCO legs are never hidden on page 2+.
+        params = {"status": "open", "limit": 500, "direction": "asc", "nested": "false"}
+        orders = []
+        seen_ids = set()
+        for _ in range(20):
+            page = self.call(PAPER, "/v2/orders", params)
+            if not isinstance(page, list):
+                raise RuntimeError("Alpaca açık emir listesi beklenen liste biçiminde değil.")
+            for order in page:
+                order_id = order.get("id")
+                if order_id and order_id not in seen_ids:
+                    seen_ids.add(order_id)
+                    orders.append(order)
+            if len(page) < 500:
+                break
+            last_id = page[-1].get("id")
+            if not last_id:
+                raise RuntimeError("Alpaca emir sayfalamasında son emir kimliği eksik.")
+            params["after_order_id"] = last_id
+        else:
+            raise RuntimeError("Açık emir sayısı 10.000 kayıt sınırını aştı; güvenlik için işlem taraması durduruldu.")
+        return orders
     def bars(self, symbols):
         # Alpaca's limit is shared across all symbols in a request and results are
         # ordered by symbol. Keep each request small enough to fit one year of daily
