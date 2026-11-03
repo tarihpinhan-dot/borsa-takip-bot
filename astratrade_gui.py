@@ -2,6 +2,7 @@ import base64, ctypes, json, math, os, queue, threading, time, uuid, urllib.pars
 from urllib.error import HTTPError, URLError
 from datetime import datetime, timedelta, timezone
 from tkinter import ttk, messagebox
+from zoneinfo import ZoneInfo
 
 PAPER = "https://paper-api.alpaca.markets"
 DATA = "https://data.alpaca.markets"
@@ -200,6 +201,34 @@ class Alpaca:
                     break
                 params["page_token"] = token
         return {"bars": collected}
+
+    def intraday_bars(self, symbols, days=5):
+        """Fetch recent 5-minute IEX bars in safe 20-symbol chunks."""
+        collected = {}
+        for offset in range(0, len(symbols), 20):
+            chunk = symbols[offset:offset + 20]
+            params = {
+                "symbols": ",".join(chunk),
+                "timeframe": "5Min",
+                "limit": 10000,
+                "feed": "iex",
+                "adjustment": "raw",
+                "start": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
+                "end": datetime.now(timezone.utc).isoformat(),
+                "sort": "asc"
+            }
+            for page_number in range(10):
+                page = self.call(DATA, "/v2/stocks/bars", params)
+                for symbol, rows in page.get("bars", {}).items():
+                    collected.setdefault(symbol, []).extend(rows)
+                token = page.get("next_page_token")
+                if not token:
+                    break
+                params["page_token"] = token
+            else:
+                raise RuntimeError("5 dakikalık veri sayfalaması 10 sayfada tamamlanmadı; tarama güvenlik için durduruldu.")
+        return {"bars": collected}
+
     def history(self, symbol, timeframe="1Day", days=365, adjustment="raw"):
         params = {
             "timeframe": timeframe,
@@ -408,6 +437,185 @@ def analyze(rows):
         "prior_20_high": prior_20_high,
         "score": score, "action": action, "conditions": conditions
     }
+
+def _parse_utc(value):
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or "").strip().replace("Z", "+00:00")
+        if not raw:
+            raise ValueError("Zaman damgası boş.")
+        dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def prepare_intraday_rows(rows, now=None):
+    """Keep completed regular-session 5-minute bars and report whether the last is fresh."""
+    rows = rows or []
+    now_utc = _parse_utc(now) if now is not None else datetime.now(timezone.utc)
+    ny = ZoneInfo("America/New_York")
+    completed = []
+    for row in rows:
+        try:
+            stamp = _parse_utc(row.get("t"))
+            local = stamp.astimezone(ny)
+            minute_of_day = local.hour * 60 + local.minute
+            if local.weekday() >= 5 or not (570 <= minute_of_day < 960):
+                continue
+            if stamp + timedelta(minutes=5) <= now_utc + timedelta(seconds=2):
+                completed.append(row)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    completed.sort(key=lambda item: _parse_utc(item.get("t")))
+    if not completed:
+        return [], None, False
+    try:
+        price = float(completed[-1].get("c", 0) or 0)
+        last_end = _parse_utc(completed[-1].get("t")) + timedelta(minutes=5)
+        age_seconds = (now_utc - last_end).total_seconds()
+        fresh = price > 0 and -60 <= age_seconds <= 600
+    except (TypeError, ValueError):
+        price, fresh = None, False
+    return completed, price if price and price > 0 else None, fresh
+
+
+def aggregate_15m(rows):
+    grouped = {}
+    for row in rows or []:
+        stamp = _parse_utc(row.get("t"))
+        bucket = int(stamp.timestamp() // 900) * 900
+        grouped.setdefault(bucket, []).append(row)
+    result = []
+    for bucket in sorted(grouped):
+        items = sorted(grouped[bucket], key=lambda item: _parse_utc(item.get("t")))
+        if len(items) < 2:
+            continue
+        result.append({
+            "t": datetime.fromtimestamp(bucket, timezone.utc).isoformat(),
+            "o": float(items[0]["o"]),
+            "h": max(float(x["h"]) for x in items),
+            "l": min(float(x["l"]) for x in items),
+            "c": float(items[-1]["c"]),
+            "v": sum(float(x.get("v", 0) or 0) for x in items)
+        })
+    return result
+
+
+def wilder_rsi(values, period=14):
+    if len(values) <= period:
+        return 50.0
+    changes = [float(values[i]) - float(values[i-1]) for i in range(1, len(values))]
+    gains = [max(0.0, change) for change in changes]
+    losses = [max(0.0, -change) for change in changes]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(changes)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0 if avg_gain else 50.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)
+
+
+def analyze_intraday(rows, daily_signal):
+    """Short-horizon long-only setup: 5m trigger, 15m confirmation and daily regime."""
+    if len(rows or []) < 60 or not daily_signal:
+        return None
+    c = [float(x["c"]) for x in rows]
+    h = [float(x["h"]) for x in rows]
+    l = [float(x["l"]) for x in rows]
+    v = [float(x.get("v", 0) or 0) for x in rows]
+    price = c[-1]
+    ema9 = ema(c[-100:], 9)
+    ema21 = ema(c[-150:], 21)
+    macd_line = [a - b for a, b in zip(ema_series(c, 12), ema_series(c, 26))]
+    macd_hist = macd_line[-1] - ema(macd_line[-40:], 9)
+    rsi = wilder_rsi(c, 14)
+    true_ranges = [
+        max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+        for i in range(len(c)-14, len(c))
+    ]
+    atr = sum(true_ranges) / len(true_ranges)
+    previous_volume = sum(v[-21:-1]) / 20 if len(v) >= 21 else 0.0
+    relative_volume = v[-1] / previous_volume if previous_volume > 0 else 0.0
+
+    ny = ZoneInfo("America/New_York")
+    last_date = _parse_utc(rows[-1]["t"]).astimezone(ny).date()
+    session_rows = [
+        row for row in rows
+        if _parse_utc(row["t"]).astimezone(ny).date() == last_date
+    ]
+    volume_sum = sum(float(x.get("v", 0) or 0) for x in session_rows)
+    vwap = (
+        sum(
+            ((float(x["h"]) + float(x["l"]) + float(x["c"])) / 3)
+            * float(x.get("v", 0) or 0)
+            for x in session_rows
+        ) / volume_sum
+        if volume_sum > 0 else price
+    )
+    previous_high = max(h[-13:-1])
+    fifteen = aggregate_15m(rows)
+    if len(fifteen) < 12:
+        return None
+    c15 = [float(x["c"]) for x in fifteen]
+    ema9_15 = ema(c15[-80:], 9)
+    ema21_15 = ema(c15[-120:], 21)
+
+    conditions = {
+        "5m_trend": ema9 > ema21,
+        "15m_trend": ema9_15 > ema21_15,
+        "macd_positive": macd_hist > 0,
+        "rsi_window": 50 <= rsi <= 70,
+        "above_vwap": price > vwap,
+        "12_bar_breakout": price > previous_high,
+        "relative_volume": relative_volume >= 1.15
+    }
+    score = sum(bool(value) for value in conditions.values()) / len(conditions)
+    daily_uptrend = (
+        float(daily_signal.get("price", 0)) > float(daily_signal.get("sma200", 0))
+        and float(daily_signal.get("ema50", 0)) > float(daily_signal.get("sma200", 0))
+    )
+    liquid = float(daily_signal.get("dollar_vol", 0)) >= 25_000_000
+    hard_gates = conditions["5m_trend"] and conditions["15m_trend"] and conditions["above_vwap"]
+    action = "BUY" if daily_uptrend and liquid and hard_gates and score >= 5/7 else (
+        "SELL" if price < ema21 and price < vwap and macd_hist < 0 else "HOLD"
+    )
+    return {
+        "price": price, "ema9": ema9, "ema21": ema21, "ema9_15": ema9_15,
+        "ema21_15": ema21_15, "macd_hist": macd_hist, "rsi": rsi,
+        "atr": atr, "vwap": vwap, "relative_volume": relative_volume,
+        "prior_12_high": previous_high, "score": score, "action": action,
+        "conditions": conditions, "daily_uptrend": daily_uptrend,
+        "dollar_vol": float(daily_signal.get("dollar_vol", 0))
+    }
+
+
+def intraday_exit_levels(price, atr):
+    """Return a 0.60%-1.20% volatility-aware stop and at least 1.20% target."""
+    price = float(price)
+    atr = float(atr)
+    if price <= 0 or atr <= 0:
+        return None
+    stop_distance = max(1.2 * atr, price * 0.006)
+    if stop_distance > price * 0.012:
+        return None
+    target_distance = max(price * 0.012, stop_distance * 1.6)
+    if target_distance > price * 0.025:
+        return None
+    stop = round(price - stop_distance, 2)
+    target = round(price + target_distance, 2)
+    if stop <= 0 or target <= price:
+        return None
+    return {
+        "stop": stop, "target": target,
+        "stop_distance": price - stop,
+        "target_distance": target - price
+    }
+
+
 def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
     if len(rows) < 250 or len(spy_rows) < 250:
         raise ValueError("En az 250 günlük mum gerekli; veri sağlayıcısı bu sembole daha az geçmiş döndürdü.")
@@ -682,7 +890,7 @@ class Bot:
                 self.stop.set()
             return False
 
-    def run(self):
+    def _run_legacy(self):
         self.broker.account()
         assets = self.broker.assets()
         symbols = sorted({str(a.get("symbol", "")).strip() for a in assets if is_eligible_common_stock(a)})
@@ -896,6 +1104,261 @@ class Bot:
                 self.events.put(("log", "Tarama hatası: " + str(exc)))
             self.stop.wait(scan_interval)
         self.events.put(("log", "Bot durduruldu."))
+
+    def _run_intraday(self):
+        """Production strategy: top-liquid universe, 5m entries, 15m confirmation, intraday exits."""
+        self.broker.account()
+        assets = self.broker.assets()
+        symbols = sorted({
+            str(asset.get("symbol", "")).strip()
+            for asset in assets if is_eligible_common_stock(asset)
+        })
+        if not symbols:
+            raise RuntimeError("Alpaca'dan uygun ABD adi hissesi alınamadı.")
+
+        startup_clock = self.broker.clock()
+        market_day = str(startup_clock.get("timestamp", ""))[:10]
+        self.events.put(("log", f"ABD adi hisse evreni: {len(symbols)} sembol; likidite sıralaması hazırlanıyor."))
+        daily_data = self.broker.bars(symbols).get("bars", {})
+        daily_signals = {}
+        for symbol in symbols:
+            completed, _, _ = prepare_daily_signal_rows(
+                daily_data.get(symbol, []), bool(startup_clock.get("is_open")), market_day
+            )
+            signal = analyze(completed)
+            if signal and signal["price"] >= 10 and signal["dollar_vol"] >= 20_000_000:
+                daily_signals[symbol] = signal
+        ranked = sorted(
+            daily_signals,
+            key=lambda symbol: daily_signals[symbol]["dollar_vol"],
+            reverse=True
+        )
+        scan_symbols = ranked[:300]
+        if not scan_symbols:
+            raise RuntimeError("20 milyon USD üzeri ortalama günlük dolar hacmine sahip yeterli aday bulunamadı.")
+        self.daily_signals = daily_signals
+        self.scan_symbols = scan_symbols
+        spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
+        spy_completed, _, _ = prepare_daily_signal_rows(
+            spy_rows, bool(startup_clock.get("is_open")), market_day
+        )
+        spy_signal = analyze(spy_completed)
+        market_ok = bool(
+            spy_signal
+            and spy_signal["price"] > spy_signal["sma200"]
+            and spy_signal["ema50"] > spy_signal["sma200"]
+        )
+        self.events.put(("log", f"Kısa vadeli izleme listesi: {len(scan_symbols)} en likit hisse | günlük ortalama dolar hacmi en az USD 20 milyon."))
+        self.events.put(("log", "Strateji: 5 dakikalık EMA9/21 + VWAP + MACD + Wilder RSI + 12 mum kırılımı + hacim; 15 dakikalık EMA9/21 teyidi; günlük SMA200 rejim filtresi."))
+        self.events.put(("log", "İşlem planı: hedef en az %1,20; volatiliteye bağlı stop %0,60-%1,20; 60 dakika azami taşıma; 15:45 ET gün sonu kapatma."))
+        self.events.put(("log", "Risk motoru: işlem başına azami %0,25 risk bütçesi, pozisyon başına %7, yönetilen toplam maruziyet %30, günlük zarar kilidi %1,5, zirveden düşüş kilidi %5."))
+
+        while not self.stop.is_set():
+            cycle_started = time.monotonic()
+            try:
+                clock = self.broker.clock()
+                if not clock.get("is_open"):
+                    self.events.put(("log", "Piyasa kapalı; yeni intraday işlem gönderilmiyor. Açılışta otomatik devam edilecek."))
+                    self.stop.wait(300)
+                    continue
+                now_utc = _parse_utc(clock.get("timestamp"))
+                ny_now = now_utc.astimezone(ZoneInfo("America/New_York"))
+                minute_of_day = ny_now.hour * 60 + ny_now.minute
+                can_enter_time = 585 <= minute_of_day < 900  # 09:45-15:00 ET
+                force_flat_time = minute_of_day >= 945       # 15:45 ET
+
+                positions = self.broker.positions()
+                held = {p["symbol"]: p for p in positions if p.get("symbol")}
+                open_orders = self.broker.open_orders()
+                pending = {o.get("symbol") for o in open_orders if o.get("symbol")}
+                pending_buy_symbols = {
+                    o.get("symbol") for o in open_orders
+                    if o.get("symbol") and str(o.get("side", "")).lower() == "buy"
+                }
+                pending_market_sell_symbols = {
+                    o.get("symbol") for o in open_orders
+                    if o.get("symbol") and str(o.get("side", "")).lower() == "sell" and not o.get("group_role")
+                }
+
+                for order in open_orders:
+                    symbol = order.get("symbol")
+                    if not symbol:
+                        continue
+                    if str(order.get("side", "")).lower() == "buy" and str(order.get("client_order_id", "")).startswith("astra-"):
+                        self.managed_symbols.add(symbol)
+                    if symbol in self.managed_symbols and order.get("group_id") and order.get("group_role") in ("take_profit", "stop_loss"):
+                        self.managed_groups[symbol] = str(order["group_id"])
+                        protection = self.managed_protection.setdefault(symbol, {})
+                        if order.get("group_role") == "take_profit" and order.get("limit_price"):
+                            protection["take_profit"] = float(order["limit_price"])
+                        elif order.get("group_role") == "stop_loss" and order.get("stop_price"):
+                            protection["stop_loss"] = float(order["stop_price"])
+
+                active_symbols = set(held) | pending
+                removed_symbols = self.managed_symbols - active_symbols
+                self.managed_symbols.intersection_update(active_symbols)
+                for removed in removed_symbols:
+                    self.managed_groups.pop(removed, None)
+                    self.managed_protection.pop(removed, None)
+                self._save_management_state()
+
+                # Time exits are evaluated every cycle for all AstraTrade intraday holdings,
+                # not just when their ticker happens to appear in the scanning list.
+                for symbol in sorted(set(held) & self.managed_symbols):
+                    meta = self.managed_protection.get(symbol, {})
+                    if meta.get("strategy") != "intraday_v1" or symbol in pending_market_sell_symbols:
+                        continue
+                    opened_at = meta.get("opened_at")
+                    try:
+                        elapsed_minutes = (now_utc - _parse_utc(opened_at)).total_seconds() / 60
+                    except (TypeError, ValueError):
+                        elapsed_minutes = 0
+                    max_hold = float(meta.get("max_hold_minutes", 60) or 60)
+                    if elapsed_minutes >= max_hold or force_flat_time:
+                        self.events.put(("log", f"ZAMAN ÇIKIŞI {symbol}: taşıma {elapsed_minutes:.0f} dk; pozisyon kapatılıyor."))
+                        if self._close_managed_position(symbol, open_orders):
+                            pending_market_sell_symbols.add(symbol)
+
+                intraday_symbols = sorted(set(scan_symbols) | {
+                    symbol for symbol in held
+                    if self.managed_protection.get(symbol, {}).get("strategy") == "intraday_v1"
+                })
+                intraday_data = self.broker.intraday_bars(intraday_symbols, days=5).get("bars", {})
+                equity_account = self.broker.account()
+                equity = float(equity_account.get("equity", 0) or 0)
+                cash = float(equity_account.get("cash", 0) or 0)
+                last_equity = float(equity_account.get("last_equity", equity) or equity)
+                daily_return = (equity - last_equity) / last_equity if last_equity else 0.0
+                state = read_app_state()
+                peak_equity = float(state.get("peak_equity", equity) or equity)
+                if "peak_equity" not in state or equity > peak_equity:
+                    peak_equity = equity
+                    write_app_state(peak_equity=peak_equity)
+                peak_drawdown = (equity - peak_equity) / peak_equity if peak_equity else 0.0
+                risk_allowed = daily_return > -0.015 and peak_drawdown > -0.05
+
+                managed_active = set(self.managed_symbols)
+                managed_exposure = sum(
+                    abs(float(position.get("market_value", 0) or 0))
+                    for symbol, position in held.items() if symbol in managed_active
+                )
+                pending_buy_unfilled = pending_buy_symbols - set(held)
+                pending_managed_buys = pending_buy_unfilled & managed_active
+                managed_exposure += len(pending_managed_buys) * equity * 0.07
+                reserved_cash = len(pending_buy_unfilled) * equity * 0.07
+                available_cash = max(0.0, cash - reserved_cash)
+                reserved = set(held) | pending | pending_market_sell_symbols
+
+                scanned = 0
+                best_score = 0.0
+                buy_signal_count = 0
+                order_blocked = {
+                    "piyasa_kapali": 0, "giris_saati": 0, "veri_eski": 0,
+                    "gunluk_trend": 0, "spy_filtresi": 0, "gunluk_risk": 0,
+                    "bekleyen_emir": 0, "pozisyon_limiti": 0, "stop_genis": 0,
+                    "miktar_sifir": 0
+                }
+                stale_count = 0
+                for symbol in scan_symbols:
+                    if self.stop.is_set():
+                        break
+                    completed, live_price, fresh = prepare_intraday_rows(
+                        intraday_data.get(symbol, []), now_utc
+                    )
+                    daily_signal = daily_signals.get(symbol)
+                    signal = analyze_intraday(completed, daily_signal)
+                    if not signal:
+                        stale_count += 1
+                        continue
+                    scanned += 1
+                    best_score = max(best_score, signal["score"])
+                    if signal["action"] == "BUY":
+                        buy_signal_count += 1
+                        if not can_enter_time:
+                            order_blocked["giris_saati"] += 1
+                        elif not fresh or live_price is None:
+                            order_blocked["veri_eski"] += 1
+                        elif not signal["daily_uptrend"]:
+                            order_blocked["gunluk_trend"] += 1
+                        elif not market_ok:
+                            order_blocked["spy_filtresi"] += 1
+                        elif not risk_allowed:
+                            order_blocked["gunluk_risk"] += 1
+                        elif symbol in pending_buy_symbols or symbol in reserved:
+                            order_blocked["bekleyen_emir"] += 1
+                        elif len(managed_active) >= MAX_MANAGED_POSITIONS:
+                            order_blocked["pozisyon_limiti"] += 1
+                        else:
+                            levels = intraday_exit_levels(live_price, signal["atr"])
+                            if not levels:
+                                order_blocked["stop_genis"] += 1
+                                continue
+                            qty = calculate_order_qty(
+                                equity, available_cash, live_price,
+                                levels["stop_distance"], managed_exposure
+                            )
+                            if not qty:
+                                order_blocked["miktar_sifir"] += 1
+                                continue
+                            try:
+                                result = self.broker.order(
+                                    symbol, qty, "buy",
+                                    take_profit=levels["target"], stop_loss=levels["stop"]
+                                )
+                            except Exception as order_error:
+                                self.events.put(("log", f"ALIŞ EMRİ REDDEDİLDİ {symbol}: {order_error}"))
+                                continue
+                            self.managed_symbols.add(symbol)
+                            if result.get("group_id"):
+                                self.managed_groups[symbol] = str(result["group_id"])
+                            self.managed_protection[symbol] = {
+                                "take_profit": levels["target"],
+                                "stop_loss": levels["stop"],
+                                "qty": qty,
+                                "strategy": "intraday_v1",
+                                "opened_at": now_utc.isoformat(),
+                                "max_hold_minutes": 60,
+                                "entry_price": live_price
+                            }
+                            self._save_management_state()
+                            managed_active.add(symbol)
+                            reserved.add(symbol)
+                            pending.add(symbol)
+                            pending_buy_symbols.add(symbol)
+                            managed_exposure += qty * live_price
+                            available_cash = max(0.0, available_cash - qty * live_price)
+                            self.events.put((
+                                "log",
+                                f"ASTRATRADE PAPER KISA VADE ALIŞ {symbol} x{qty} | skor {signal['score']*100:.0f}/100 | giriş USD {live_price:.2f} | SL {levels['stop']:.2f} ({levels['stop_distance']/live_price*100:.2f}%) | TP {levels['target']:.2f} ({levels['target_distance']/live_price*100:.2f}%) | azami taşıma 60 dk | {result.get('status')}"
+                            ))
+                    elif signal["action"] == "SELL" and symbol in held and symbol in self.managed_symbols:
+                        meta = self.managed_protection.get(symbol, {})
+                        if meta.get("strategy") == "intraday_v1" and symbol not in pending_market_sell_symbols:
+                            self.events.put(("log", f"TERS SİNYAL ÇIKIŞI {symbol}: 5 dakikalık trend/VWAP zayıfladı."))
+                            if self._close_managed_position(symbol, open_orders):
+                                pending_market_sell_symbols.add(symbol)
+
+                self.events.put(("status", (
+                    len(symbols), scanned, equity, cash, len(held), True,
+                    daily_return, len(managed_active)
+                )))
+                self.events.put(("log", f"Kısa vade taraması: {scanned}/{len(scan_symbols)} hisse analiz | en yüksek skor {best_score:.2f}/1,00 | BUY sinyali {buy_signal_count}."))
+                self.events.put(("log", "Emir engelleri: " + ", ".join(f"{key}={value}" for key, value in order_blocked.items()) + "."))
+                self.events.put(("log", f"Güncel olmayan/veri yetersiz intraday sembol: {stale_count}. Veri kaynağı: IEX 5 dakikalık mumlar."))
+                self.events.put(("log", f"Piyasa: açık | SPY günlük rejim filtresi: {'OLUMLU' if market_ok else 'OLUMSUZ'} | aktif yönetilen pozisyon: {len(managed_active)}/5."))
+            except Exception as exc:
+                self.events.put(("log", "Kısa vade tarama hatası: " + str(exc)))
+            elapsed = time.monotonic() - cycle_started
+            self.stop.wait(max(1, 300 - elapsed))
+        self.events.put(("log", "Bot durduruldu."))
+
+    def run(self):
+        if callable(getattr(self.broker, "intraday_bars", None)):
+            return self._run_intraday()
+        # Kept only for older isolated unit-test brokers; the Windows app always
+        # uses Alpaca.intraday_bars and therefore the intraday production strategy.
+        return self._run_legacy()
+
 class App:
     def __init__(self, root):
         self.root=root; root.title("AstraTrade AI"); root.geometry("1180x820"); root.minsize(1000,700); root.configure(bg="#111827")
@@ -946,9 +1409,9 @@ class App:
         self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET VE GÜVENLİ KAYDET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
         tk.Label(box,text="Başarılı bağlantıdan sonra anahtarlar Windows hesabına bağlı DPAPI şifrelemesiyle bu bilgisayarda saklanır ve sonraki açılışta otomatik yüklenir.",bg=panel,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",pady=4)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
-        tk.Label(settings,text="STRATEJİ: SMA200 uzun trend filtresi, EMA20/50 sıralaması, MACD, Wilder RSI 50–68, 20 günlük tepe kırılımı ve hacim onayı. Altı teknik koşuldan en az beşi gerekir; 10 milyon USD günlük ortalama dolar hacmi ayrıca zorunludur. Giriş anında fiyat EMA20 ve kırılım seviyesinin üzerinde olmalı; önceki kapanıştan 1,5 ATR fazla uzaksa alış yapılmaz. SPY piyasa rejimi de kontrol edilir. Sistem makine öğrenmesi değildir ve kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
-        tk.Label(settings,text="Her alışta 2 ATR veya %1,5 asgari stop mesafesi ve 3R hedefli bracket emir kullanılır. İşlem başına özkaynağın %0,25’i, tek pozisyonda %7’si, AstraTrade pozisyonlarının toplamında %30’u aşılmaz. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alışlar kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlar satılmaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
-        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Tarama evreni yalnızca adı Common Stock / Common Shares olan aktif NYSE, NASDAQ ve NYSE American adi hisseleridir. ETF, kaldıraçlı/ters fon, varant, imtiyazlı pay, birim ve tahvil benzeri varlıklar dışarıda bırakılır. Alış için 20 günlük ortalama dolar hacmi en az 10 milyon USD ve en az 220 günlük fiyat geçmişi gerekir. Her 5 dakikada 200 sembol taranır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="STRATEJİ: Kısa vadeli gün içi işlem. 5 dakikalık EMA9/21, VWAP, MACD, Wilder RSI, 12 mumluk kırılım ve hacim; 15 dakikalık EMA9/21 yön teyidi; günlük SMA200 ve SPY piyasa rejimi filtresi. İzleme listesi günlük ortalama en az 20 milyon USD dolar hacmine sahip en likit 300 adi hisseden oluşturulur. Sistem makine öğrenmesi değildir; kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
+        tk.Label(settings,text="Yeni gün içi işlemlerde hedef en az %1,20 (hedef/stop oranı en az 1,6); volatiliteye göre stop %0,60-%1,20 aralığında belirlenir. Azami pozisyon süresi 60 dakika, gün sonu kapatma saati 15:45 ET; yeni alış penceresi 09:45-15:00 ET. İşlem başına risk bütçesi %0,25, tek pozisyon %7, toplam yönetilen maruziyet %30. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alış kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlara ve önceden açılmış ADSK gibi eski strateji pozisyonlarına otomatik müdahale edilmez.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Piyasa verisi ücretsiz IEX akışıdır; tüm ABD borsalarının işlem hacmini kapsamaz. 2.518 sembollük evrenden günlük likiditeye göre en üst 300 hisse seçilir ve her 5 dakikada tamamı yeniden taranır. Sadece aktif NYSE/NASDAQ/NYSE American adi hisseleri kullanılır; ETF ve diğer fonlar dışarıda bırakılır. Önceden açılmış pozisyonların koruma emirleri değiştirilmez. Gerçek para hesabı desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         # Midas benzeri mum grafiği: fiyat, EMA20/50 ve hacim.
         chart_controls=tk.Frame(chart,bg=bg,padx=15,pady=12); chart_controls.pack(fill="x")
         tk.Label(chart_controls,text="Hisse kodu",bg=bg,fg="white").pack(side="left")
