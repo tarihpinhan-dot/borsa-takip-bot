@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install --upgrade pip pyinstaller
+      - run: python -m pip install --upgrade pip pyinstaller tzdata
       - run: python -m py_compile astratrade_gui.py
       - run: python -m unittest discover -s tests -v
       - run: pyinstaller --noconfirm --clean --onefile --windowed --name AstraTradeAI astratrade_gui.py
