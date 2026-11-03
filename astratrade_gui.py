@@ -106,8 +106,16 @@ def load_credentials():
 def logline(msg):
     line = datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ") + str(msg)
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(line + "\n")
-    except Exception: pass
+        # Keep a bounded active log plus one rotated backup for long-running sessions.
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) >= 5 * 1024 * 1024:
+            backup = LOG_FILE + ".1"
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.replace(LOG_FILE, backup)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
     return line
 
 class Alpaca:
@@ -724,6 +732,11 @@ class Bot:
                 best_score = 0.0
                 buy_signal_count = 0
                 blocked = {"trend": 0, "score": 0, "liquidity": 0, "other": 0}
+                order_blocked = {
+                    "piyasa_kapali": 0, "veri_eski": 0, "spy_filtresi": 0,
+                    "gunluk_risk": 0, "bekleyen_emir": 0, "pozisyon_limiti": 0,
+                    "miktar_sifir": 0
+                }
                 stale_price_count = 0
                 for sym in batch:
                     if self.stop.is_set():
@@ -757,17 +770,30 @@ class Bot:
                     scanned += 1
                     self.events.put(("decision", (sym, action, f["score"], live_price, f["rsi"])))
 
-                    if not clock.get("is_open"):
-                        continue
-                    if sym in pending_buy_symbols:
-                        continue
-
-                    if action == "BUY" and fresh_price and market_ok and risk_allowed and sym not in reserved and len(managed_active) < MAX_MANAGED_POSITIONS:
-                        distance = max(2.0*f["atr"], live_price*0.015)
-                        if distance <= 0 or distance >= live_price*0.25:
-                            continue
-                        qty = calculate_order_qty(equity, available_cash, live_price, distance, managed_exposure)
-                        if qty:
+                    if action == "BUY":
+                        if not clock.get("is_open"):
+                            order_blocked["piyasa_kapali"] += 1
+                        elif sym in pending_buy_symbols:
+                            order_blocked["bekleyen_emir"] += 1
+                        elif not fresh_price:
+                            order_blocked["veri_eski"] += 1
+                        elif not market_ok:
+                            order_blocked["spy_filtresi"] += 1
+                        elif not risk_allowed:
+                            order_blocked["gunluk_risk"] += 1
+                        elif sym in reserved:
+                            order_blocked["bekleyen_emir"] += 1
+                        elif len(managed_active) >= MAX_MANAGED_POSITIONS:
+                            order_blocked["pozisyon_limiti"] += 1
+                        else:
+                            distance = max(2.0*f["atr"], live_price*0.015)
+                            if distance <= 0 or distance >= live_price*0.25:
+                                order_blocked["miktar_sifir"] += 1
+                                continue
+                            qty = calculate_order_qty(equity, available_cash, live_price, distance, managed_exposure)
+                            if not qty:
+                                order_blocked["miktar_sifir"] += 1
+                                continue
                             stop_price = round(live_price-distance, 2)
                             take_profit_price = round(live_price+3.0*distance, 2)
                             try:
@@ -792,13 +818,18 @@ class Bot:
                             available_cash = max(0.0, available_cash-qty*live_price)
                             self.events.put(("log", f"ASTRATRADE PAPER ALIŞ {sym} x{qty} | skor {f['score']*100:.0f}/100 | planlanan risk USD {qty*distance:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
                     elif action == "SELL" and sym in held and sym in self.managed_symbols:
+                        if not clock.get("is_open"):
+                            continue
                         if sym in pending_market_sell_symbols:
+                            continue
+                        if sym in pending_buy_symbols:
                             continue
                         self._close_managed_position(sym, open_orders)
                 self.events.put(("status", (len(symbols), scanned, equity, cash, len(held), bool(clock.get("is_open")), daily_return, len(managed_active))))
                 data_symbols = sum(1 for count in bar_counts.values() if count > 0)
                 self.events.put(("log", f"Tarama kalitesi: {scanned} analiz | en yüksek skor {best_score:.2f}/1,00 | BUY sinyali {buy_signal_count}."))
-                self.events.put(("log", f"BUY engelleri (çakışabilir): trend {blocked['trend']}, skor {blocked['score']}, likidite {blocked['liquidity']}, diğer {blocked['other']}. Alış için 6 teknik koşuldan en az 5'i ve 10 milyon USD ortalama dolar hacmi zorunlu."))
+                self.events.put(("log", f"Teknik BUY engelleri (öncelikli sınıflama): trend {blocked['trend']}, skor {blocked['score']}, likidite {blocked['liquidity']}, diğer {blocked['other']}. Alış için 6 teknik koşuldan en az 5'i ve 10 milyon USD ortalama dolar hacmi zorunlu."))
+                self.events.put(("log", "Emir engelleri: " + ", ".join(f"{key}={value}" for key, value in order_blocked.items()) + "."))
                 self.events.put(("log", f"Canlı fiyatı güncel olmayan sembol: {stale_price_count}; bu sembollere yeni alış gönderilmedi."))
                 self.events.put(("log", f"Veri: {data_symbols}/{len(batch)} sembol; {total_daily_bars} günlük bar; 220+ bar geçmişi olan: {sufficient_history}. SPY piyasa filtresi: {'OLUMLU' if market_ok else 'OLUMSUZ'}."))
                 self.events.put(("log", f"Veri örneği: {samples}"))
@@ -1037,7 +1068,15 @@ class App:
         canvas.create_text(right,top+17,anchor="ne",fill="#7aa2f7",text="EMA50",font=("Segoe UI",8))
 
     def add_log(self,msg):
-        line=logline(msg); self.log.insert("end",line+"\n"); self.log.see("end")
+        line = logline(msg)
+        self.log.insert("end", line + "\n")
+        try:
+            line_count = int(self.log.index("end-1c").split(".")[0])
+            if line_count > 3000:
+                self.log.delete("1.0", f"{line_count-2500}.0")
+        except Exception:
+            pass
+        self.log.see("end")
     def test_connection(self):
         key=self.key.get().strip(); secret=self.secret.get().strip()
         if not key or not secret: messagebox.showwarning("Eksik bilgi","Paper API Key ve Secret Key gir."); return
@@ -1080,7 +1119,7 @@ class App:
                         f"PROFIT FACTOR: {pf} | MAKS. DÜŞÜŞ: {result['max_drawdown']:.2f}%\n"
                         f"AYNI HİSSE AL-TUT: {result['benchmark']:.2f}% | SPY AL-TUT: {result['spy_benchmark']:.2f}%\n"
                         f"İŞLEM BAŞINA ORT. K/Z: USD {result['avg_trade']:.2f}\n\n"
-                        "Not: Tek hisse üzerinde tarihsel simülasyondur. Emir defteri, temettü, vergi ve tüm piyasa etkileri eksiksiz modellenmez; canlı sonuç garantisi değildir.\n")
+                        "Not: Tek hisse üzerinde yaklaşık tarihsel simülasyondur. Günlük %1,5 intraday kilidi, temettüler, komisyonlar, emir defteri ve piyasa derinliği tam modellenmez. Split-adjusted günlük veri, %0,10 giriş/çıkış kayması ve giriş gününde stop/hedef kontrolü kullanılır; canlı sonuç garantisi değildir.\n")
                     self.backtest_output.delete("1.0","end"); self.backtest_output.insert("end",report)
                 elif kind=="backtest_error":
                     self.backtest_output.insert("end","TEST HATASI: "+value+"\n")
