@@ -126,6 +126,47 @@ class AstraTradeCoreTests(unittest.TestCase):
         self.assertEqual(broker.closed, ["AAPL"])
         self.assertEqual([o["id"] for o in broker.orders], ["msft-tp"])
 
+
+    def test_order_requests_are_bracket_and_recovery_oco(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        with patch.object(broker, "call", return_value={"status": "new"}) as mocked:
+            broker.order("AAPL", 5, "buy", take_profit=120.0, stop_loss=90.0)
+            body = mocked.call_args.kwargs["body"]
+            self.assertEqual(body["order_class"], "bracket")
+            self.assertEqual(body["time_in_force"], "gtc")
+            self.assertEqual(body["take_profit"]["limit_price"], "120.00")
+            self.assertEqual(body["stop_loss"]["stop_price"], "90.00")
+        with patch.object(broker, "call", return_value={"status": "new"}) as mocked:
+            broker.restore_oco_protection("AAPL", 5, 120.0, 90.0)
+            body = mocked.call_args.kwargs["body"]
+            self.assertEqual(body["side"], "sell")
+            self.assertEqual(body["type"], "limit")
+            self.assertEqual(body["order_class"], "oco")
+            self.assertEqual(body["time_in_force"], "gtc")
+
+    def test_backtest_checks_stop_on_the_entry_day(self):
+        rows = []
+        origin = datetime(2025, 1, 2)
+        for i in range(250):
+            rows.append({
+                "t": (origin + timedelta(days=i)).isoformat() + "Z",
+                "o": 100.0, "h": 110.0, "l": 80.0, "c": 100.0, "v": 100000
+            })
+        signal = {
+            "price": 100.0, "sma200": 90.0, "ema50": 95.0,
+            "atr": 5.0, "action": "BUY"
+        }
+        with patch.object(app, "analyze", return_value=signal):
+            result = app.backtest_strategy(rows, rows)
+        self.assertGreater(result["trades"], 0)
+        self.assertEqual(result["trades_detail"][0]["reason"], "GİRİŞ GÜNÜ STOP")
+
+    @unittest.skipUnless(os.name == "nt", "Windows DPAPI is available only on Windows")
+    def test_credentials_round_trip_uses_windows_dpapi(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, "CREDENTIAL_FILE", os.path.join(tmp, "credentials.dat")):
+            app.save_credentials("TEST-PAPER-KEY", "TEST-PAPER-SECRET")
+            self.assertEqual(app.load_credentials(), ("TEST-PAPER-KEY", "TEST-PAPER-SECRET"))
+
     def test_managed_exit_does_not_cancel_manual_sell_order_on_same_symbol(self):
         orders = [
             {"id": "tp", "symbol": "AAPL", "side": "sell", "group_id": "astra-group", "group_role": "take_profit", "limit_price": "120", "status": "new"},
