@@ -784,7 +784,7 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
     }
 
 
-def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starting_equity=10000.0, slippage=0.001, now=None):
+def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starting_equity=10000.0, slippage=0.001, now=None, profit_target_usd=20.0):
     """Conservative single-symbol 5m simulation; stop wins when both barriers touch."""
     intraday_rows = intraday_rows or []
     if not intraday_rows or len(daily_rows or []) < 220 or len(spy_daily_rows or []) < 220:
@@ -837,9 +837,9 @@ def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starti
             if bar_low <= position["stop"]:
                 exit_price = min(bar_open, position["stop"]) * (1 - slippage)
                 reason = "STOP"
-            elif bar_high >= position["target"]:
-                exit_price = position["target"] * (1 - slippage)
-                reason = "HEDEF"
+            elif bar_high >= position.get("profit_trigger_price", position["target"]):
+                exit_price = max(bar_open, position.get("profit_trigger_price", position["target"])) * (1 - slippage)
+                reason = "USD KÂR HEDEFİ"
             elif i - position["entry_index"] >= 9 or (local.hour * 60 + local.minute) >= 945:
                 exit_price = bar_close * (1 - slippage)
                 reason = "ZAMAN/GÜN SONU"
@@ -862,13 +862,18 @@ def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starti
             entry = bar_open * (1 + slippage)
             levels = intraday_exit_levels(entry, signal["atr"])
             if levels:
-                qty_by_risk = int(equity * 0.0025 / levels["stop_distance"])
-                qty_by_position = int(equity * 0.07 / entry)
-                qty = max(0, min(qty_by_risk, qty_by_position))
-                if qty > 0:
+                qty = calculate_order_qty(
+                    equity, equity, entry, levels["stop_distance"], 0.0,
+                    profit_target_usd=profit_target_usd
+                )
+                dollar_target = dollar_profit_limit_price(entry, qty, profit_target_usd) if qty else None
+                if qty > 0 and dollar_target and dollar_target["distance"] <= entry * 0.02:
+                    profit_trigger_price = entry + float(profit_target_usd) / qty
                     position = {
                         "entry": entry, "qty": qty, "stop": levels["stop"],
-                        "target": levels["target"], "entry_index": i
+                        "target": dollar_target["price"],
+                        "profit_trigger_price": profit_trigger_price,
+                        "entry_index": i
                     }
                     if bar_low <= position["stop"]:
                         exit_price = min(bar_open, position["stop"]) * (1 - slippage)
@@ -877,11 +882,11 @@ def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starti
                         trades.append({"pnl": pnl, "entry": entry, "exit": exit_price, "qty": qty, "reason": "GİRİŞ MUMU STOP"})
                         (wins if pnl > 0 else losses).append(pnl)
                         position = None
-                    elif bar_high >= position["target"]:
-                        exit_price = position["target"] * (1 - slippage)
+                    elif bar_high >= position.get("profit_trigger_price", position["target"]):
+                        exit_price = max(bar_open, position.get("profit_trigger_price", position["target"])) * (1 - slippage)
                         pnl = (exit_price - entry) * qty
                         equity += pnl
-                        trades.append({"pnl": pnl, "entry": entry, "exit": exit_price, "qty": qty, "reason": "GİRİŞ MUMU HEDEF"})
+                        trades.append({"pnl": pnl, "entry": entry, "exit": exit_price, "qty": qty, "reason": "GİRİŞ MUMU USD KÂR HEDEFİ"})
                         (wins if pnl > 0 else losses).append(pnl)
                         position = None
 
@@ -1618,11 +1623,14 @@ class App:
         tk.Label(box,text="YALNIZCA Paper API anahtarlarını gir. Gerçek hesap anahtarlarını kullanma.",bg=panel,fg="#ffc36d").pack(anchor="w",pady=12)
         tk.Label(box,text="Paper API Key",bg=panel,fg="white").pack(anchor="w"); self.key=tk.Entry(box,font=("Consolas",10)); self.key.pack(fill="x",pady=5)
         tk.Label(box,text="Paper Secret Key",bg=panel,fg="white").pack(anchor="w"); self.secret=tk.Entry(box,show="*",font=("Consolas",10)); self.secret.pack(fill="x",pady=5)
+        tk.Label(box,text="Pozisyon başına otomatik kâr hedefi (USD)",bg=panel,fg="white").pack(anchor="w",pady=(8,0))
+        self.profit_target_entry=tk.Entry(box,font=("Consolas",10),width=14); self.profit_target_entry.insert(0,"20"); self.profit_target_entry.pack(anchor="w",pady=5)
+        tk.Label(box,text="Botun açtığı her yeni pozisyon, bu tutarda gerçekleşmemiş dolar kârına ulaştığında otomatik kapatılır. Emirde küçük bir fiyat-kayması payı bulunur.",bg=panel,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",pady=(0,6))
         self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET VE GÜVENLİ KAYDET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
         tk.Label(box,text="Başarılı bağlantıdan sonra anahtarlar Windows hesabına bağlı DPAPI şifrelemesiyle bu bilgisayarda saklanır ve sonraki açılışta otomatik yüklenir.",bg=panel,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",pady=4)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
         tk.Label(settings,text="STRATEJİ: Kısa vadeli gün içi işlem. 5 dakikalık EMA9/21, VWAP, MACD, Wilder RSI, 6 mumluk (30 dk) kırılım ve hacim; 15 dakikalık EMA9/21 yön teyidi; günlük SMA200 ve SPY piyasa rejimi filtresi. İzleme listesi günlük ortalama en az 20 milyon USD dolar hacmine sahip en likit 300 adi hisseden oluşturulur. Sistem makine öğrenmesi değildir; kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
-        tk.Label(settings,text="Yeni gün içi işlemlerde hedef %0,80-%2,00 aralığında (hedef/stop oranı en az 1,6); volatiliteye göre stop %0,50-%1,00 aralığında belirlenir. Azami pozisyon süresi 45 dakika, gün sonu kapatma saati 15:45 ET; yeni alış penceresi 09:45-15:00 ET. İşlem başına risk bütçesi %0,25, tek pozisyon %7, toplam yönetilen maruziyet %30. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alış kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlara ve önceden açılmış ADSK gibi eski strateji pozisyonlarına otomatik müdahale edilmez.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Yeni pozisyonlar ayarlardaki dolar kâr hedefinde (varsayılan USD 20) kapatılır; hedef/stop oranı en az 1,6 korunacak şekilde adet hesaplanır. Hedef fiyatın girişten %2’den uzakta kalması gerekiyorsa işlem alınmaz. Volatiliteye göre stop %0,50-%1,00 aralığındadır. Azami pozisyon süresi 45 dakika, gün sonu kapatma saati 15:45 ET; yeni alış penceresi 09:45-15:00 ET. İşlem başına risk bütçesi %0,25, tek pozisyon %7, toplam yönetilen maruziyet %30. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alış kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlara ve önceden açılmış ADSK gibi eski strateji pozisyonlarına otomatik müdahale edilmez.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         tk.Label(settings,text="Piyasa verisi ücretsiz IEX akışıdır; tüm ABD borsalarının işlem hacmini kapsamaz. 2.518 sembollük evrenden günlük likiditeye göre en üst 300 hisse seçilir ve her 5 dakikada tamamı yeniden taranır. Sadece aktif NYSE/NASDAQ/NYSE American adi hisseleri kullanılır; ETF ve diğer fonlar dışarıda bırakılır. Önceden açılmış pozisyonların koruma emirleri değiştirilmez. Gerçek para hesabı desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         # Midas benzeri mum grafiği: fiyat, EMA20/50 ve hacim.
         chart_controls=tk.Frame(chart,bg=bg,padx=15,pady=12); chart_controls.pack(fill="x")
@@ -1823,9 +1831,17 @@ class App:
         if not self.key.get().strip() or not self.secret.get().strip():
             self.tabs.select(self.settings); messagebox.showwarning("Bağlantı","Önce Paper API bilgilerini gir."); return
         if self.thread and self.thread.is_alive(): return
+        try:
+            profit_target = float(self.profit_target_entry.get().strip().replace(",", "."))
+            if not math.isfinite(profit_target) or not 1.0 <= profit_target <= 10000.0:
+                raise ValueError
+        except (TypeError, ValueError):
+            messagebox.showwarning("Kâr hedefi", "Pozisyon başına kâr hedefini 1 ile 10.000 USD arasında gir.")
+            self.tabs.select(self.settings)
+            return
         self.broker=Alpaca(self.key.get().strip(),self.secret.get().strip())
         self.stop_event.clear()
-        bot=Bot(self.broker,self.events,self.stop_event); self.thread=threading.Thread(target=self.run,args=(bot,),daemon=True); self.thread.start()
+        bot=Bot(self.broker,self.events,self.stop_event,profit_target_usd=profit_target); self.thread=threading.Thread(target=self.run,args=(bot,),daemon=True); self.thread.start()
         self.start_button.configure(state="disabled"); self.stop_button.configure(state="normal"); self.connection.configure(text="● BOT ÇALIŞIYOR",fg="#36c99a")
     def run(self,bot):
         try: bot.run()
