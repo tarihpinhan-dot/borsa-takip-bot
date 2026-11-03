@@ -216,11 +216,15 @@ class Alpaca:
             logline(notice)
             if progress_callback:
                 progress_callback(notice)
+            left_symbols = symbols[:midpoint]
+            right_symbols = symbols[midpoint:]
+            left_params = dict(params, symbols=",".join(left_symbols))
+            right_params = dict(params, symbols=",".join(right_symbols))
             left_data, left_failed = self._fetch_bars_chunk(
-                symbols[:midpoint], params, max_pages, description, progress_callback
+                left_symbols, left_params, max_pages, description, progress_callback
             )
             right_data, right_failed = self._fetch_bars_chunk(
-                symbols[midpoint:], params, max_pages, description, progress_callback
+                right_symbols, right_params, max_pages, description, progress_callback
             )
             for symbol, rows in right_data.items():
                 left_data.setdefault(symbol, []).extend(rows)
