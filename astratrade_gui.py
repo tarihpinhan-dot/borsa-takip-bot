@@ -242,6 +242,90 @@ def analyze(rows):
         "atr": atr, "dollar_vol": dollar_vol, "relative_volume": relative_volume,
         "score": score, "action": action, "conditions": conditions
     }
+def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
+    if len(rows) < 250 or len(spy_rows) < 250:
+        raise ValueError("En az 250 günlük mum gerekli; veri sağlayıcısı bu sembole daha az geçmiş döndürdü.")
+    market_regime = {}
+    for j in range(219, len(spy_rows)):
+        mf = analyze(spy_rows[:j+1])
+        if mf:
+            d = str(spy_rows[j].get("t", ""))[:10]
+            market_regime[d] = mf["price"] > mf["sma200"] and mf["ema50"] > mf["sma200"]
+    equity = float(starting_equity)
+    peak = equity
+    max_dd = 0.0
+    trades = []
+    position = None
+    wins = []
+    losses = []
+    slippage = 0.001
+    for i in range(220, len(rows)):
+        signal = analyze(rows[:i])
+        if not signal:
+            continue
+        day = rows[i]
+        previous_day = str(rows[i-1].get("t", ""))[:10]
+        market_ok = market_regime.get(previous_day, False)
+        day_open = float(day["o"])
+        day_high = float(day["h"])
+        day_low = float(day["l"])
+        day_close = float(day["c"])
+        exit_price = None
+        exit_reason = ""
+        if position:
+            # Conservative same-day ambiguity: assume stop is hit before target.
+            if day_low <= position["stop"]:
+                exit_price = position["stop"] * (1-slippage)
+                exit_reason = "STOP"
+            elif day_high >= position["target"]:
+                exit_price = position["target"] * (1-slippage)
+                exit_reason = "HEDEF"
+            elif signal["action"] == "SELL":
+                exit_price = day_open * (1-slippage)
+                exit_reason = "TREND ÇIKIŞI"
+            elif i == len(rows)-1:
+                exit_price = day_close * (1-slippage)
+                exit_reason = "TEST SONU"
+            if exit_price is not None:
+                pnl = (exit_price-position["entry"])*position["qty"]
+                equity += pnl
+                trade = {"pnl":pnl,"entry":position["entry"],"exit":exit_price,"qty":position["qty"],"reason":exit_reason}
+                trades.append(trade)
+                (wins if pnl > 0 else losses).append(pnl)
+                position = None
+        if not position and signal["action"] == "BUY" and market_ok:
+            entry = day_open * (1+slippage)
+            distance = max(2.0*signal["atr"], signal["price"]*0.015)
+            if distance > 0 and distance < entry*0.25:
+                qty = max(0, min(int(equity*0.0025/distance), int(equity*0.07/entry)))
+                if qty > 0:
+                    position = {"entry":entry,"qty":qty,"stop":entry-distance,"target":entry+3.0*distance}
+        mark_to_market = equity
+        if position:
+            mark_to_market += (day_close-position["entry"])*position["qty"]
+        peak = max(peak, mark_to_market)
+        if peak > 0:
+            max_dd = max(max_dd, (peak-mark_to_market)/peak)
+    if position:
+        final_exit = float(rows[-1]["c"])*(1-slippage)
+        pnl = (final_exit-position["entry"])*position["qty"]
+        equity += pnl
+        trades.append({"pnl":pnl,"entry":position["entry"],"exit":final_exit,"qty":position["qty"],"reason":"TEST SONU"})
+        (wins if pnl > 0 else losses).append(pnl)
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = (gross_profit/gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    first = float(rows[220]["c"])
+    last = float(rows[-1]["c"])
+    benchmark = ((last/first)-1)*100 if first else 0.0
+    return {
+        "initial":starting_equity,"final":equity,"return_pct":(equity/starting_equity-1)*100,
+        "trades":len(trades),"win_rate":(len(wins)/len(trades)*100) if trades else 0.0,
+        "profit_factor":profit_factor,"max_drawdown":max_dd*100,
+        "benchmark":benchmark,"avg_trade":(sum(x["pnl"] for x in trades)/len(trades)) if trades else 0.0,
+        "trades_detail":trades
+    }
+
 def news_score(items):
     scores={}
     for item in items:
@@ -308,7 +392,7 @@ class Bot:
                 daily_return = (equity-last_equity)/last_equity if last_equity else 0.0
                 state = read_app_state()
                 peak_equity = float(state.get("peak_equity", equity) or equity)
-                if equity > peak_equity:
+                if "peak_equity" not in state or equity > peak_equity:
                     peak_equity = equity
                     write_app_state(peak_equity=peak_equity)
                 peak_drawdown = (equity-peak_equity)/peak_equity if peak_equity else 0.0
@@ -362,7 +446,7 @@ class Bot:
                             result = self.broker.order(sym, qty, "sell")
                             pending.add(sym)
                             self.events.put(("log", f"ASTRATRADE PAPER ÇIKIŞ {sym} x{qty:g} | {result.get('status')}"))
-                self.events.put(("status", (len(symbols), scanned, equity, cash, len(held), bool(clock.get("is_open")))))
+                self.events.put(("status", (len(symbols), scanned, equity, cash, len(held), bool(clock.get("is_open")), daily_return, len(managed_active))))
                 data_symbols = sum(1 for count in bar_counts.values() if count > 0)
                 self.events.put(("log", f"Veri: {data_symbols}/{len(batch)} sembol; {total_daily_bars} günlük bar; 220+ bar geçmişi olan: {sufficient_history}. SPY piyasa filtresi: {'OLUMLU' if market_ok else 'OLUMSUZ'}."))
                 self.events.put(("log", f"Veri örneği: {samples}"))
@@ -375,7 +459,7 @@ class Bot:
         self.events.put(("log", "Bot durduruldu."))
 class App:
     def __init__(self, root):
-        self.root=root; root.title("AstraTrade AI"); root.geometry("950x650"); root.configure(bg="#111827")
+        self.root=root; root.title("AstraTrade AI"); root.geometry("1180x820"); root.minsize(1000,700); root.configure(bg="#111827")
         self.events=queue.Queue(); self.stop_event=threading.Event(); self.thread=None; self.broker=None
         self.build()
         saved_key, saved_secret = load_credentials()
@@ -383,18 +467,26 @@ class App:
         if saved_secret: self.secret.insert(0, saved_secret)
         root.after(250,self.poll); root.protocol("WM_DELETE_WINDOW",self.close)
     def build(self):
+        style=ttk.Style()
+        try: style.theme_use("clam")
+        except Exception: pass
+        style.configure("TNotebook",background="#111827",borderwidth=0)
+        style.configure("TNotebook.Tab",background="#1f2d42",foreground="#cbd5e1",padding=(16,9),font=("Segoe UI",10,"bold"))
+        style.map("TNotebook.Tab",background=[("selected","#36c99a")],foreground=[("selected","#07131a")])
+        style.configure("Treeview",background="#101a2a",foreground="#e5edf7",fieldbackground="#101a2a",rowheight=28,borderwidth=0)
+        style.configure("Treeview.Heading",background="#25364d",foreground="#e5edf7",font=("Segoe UI",9,"bold"))
         bg="#111827"; panel="#1f2d42"; green="#36c99a"
         head=tk.Frame(self.root,bg=bg); head.pack(fill="x",padx=20,pady=18)
         tk.Label(head,text="ASTRATRADE AI",bg=bg,fg="white",font=("Segoe UI",22,"bold")).pack(side="left")
         tk.Label(head,text="US EQUITIES • PAPER ONLY • RULE-BASED",bg=bg,fg=green).pack(side="left",padx=15)
         self.connection=tk.Label(head,text="● BAĞLI DEĞİL",bg=bg,fg="#ffc36d"); self.connection.pack(side="right")
         tabs=ttk.Notebook(self.root); tabs.pack(fill="both",expand=True,padx=20,pady=(0,15)); self.tabs=tabs
-        home=tk.Frame(tabs,bg=bg); settings=tk.Frame(tabs,bg=bg); history=tk.Frame(tabs,bg=bg); chart=tk.Frame(tabs,bg=bg)
-        tabs.add(home,text="Genel Bakış"); tabs.add(chart,text="Piyasa Grafiği"); tabs.add(history,text="Emirler"); tabs.add(settings,text="Bağlantı ve Risk"); self.settings=settings
+        home=tk.Frame(tabs,bg=bg); settings=tk.Frame(tabs,bg=bg); history=tk.Frame(tabs,bg=bg); chart=tk.Frame(tabs,bg=bg); backtest=tk.Frame(tabs,bg=bg)
+        tabs.add(home,text="Genel Bakış"); tabs.add(chart,text="Piyasa Grafiği"); tabs.add(backtest,text="Strateji Testi"); tabs.add(history,text="Emirler"); tabs.add(settings,text="Bağlantı ve Risk"); self.settings=settings
         self.chart_page=chart
         self.metrics={}
         row=tk.Frame(home,bg=bg); row.pack(fill="x",pady=15)
-        for key,title in [("equity","SANAL HESAP"),("cash","NAKİT"),("positions","AÇIK POZİSYON")]:
+        for key,title in [("equity","SANAL ÖZKAYNAK"),("cash","KULLANILABİLİR NAKİT"),("daily","GÜNLÜK K/Z"),("positions","ASTRATRADE POZİSYON")]:
             card=tk.Frame(row,bg=panel,padx=15,pady=12); card.pack(side="left",fill="x",expand=True,padx=5)
             tk.Label(card,text=title,bg=panel,fg="#9caec1").pack(anchor="w")
             value=tk.Label(card,text="—",bg=panel,fg="white",font=("Segoe UI",18,"bold")); value.pack(anchor="w"); self.metrics[key]=value
@@ -417,7 +509,7 @@ class App:
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
         tk.Label(settings,text="STRATEJİ: SMA200 uzun trend filtresi, EMA20/50 sıralaması, tutarlı MACD, RSI 50–68, 20 günlük tepe kırılımı ve hacim onayı. Ayrıca SPY piyasa rejimi kontrol edilir. Sistem makine öğrenmesi değildir ve kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
         tk.Label(settings,text="Her alışta 2 ATR veya %1,5 asgari stop mesafesi ve 3R hedefli bracket emir kullanılır. İşlem başına özkaynağın %0,25’i, tek pozisyonda %7’si, AstraTrade pozisyonlarının toplamında %30’u aşılmaz. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alışlar kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlar satılmaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
-        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Tarama evreni yalnızca adı Common Stock / Common Shares olan aktif NYSE, NASDAQ ve NYSE American adi hisseleridir. ETF, kaldıraçlı/ters fon, varant, imtiyazlı pay, birim ve tahvil benzeri varlıklar dışarıda bırakılır. Alış için ayrıca 20 günlük ortalama günlük dolar hacmi en az 5 milyon USD olmalıdır. Her 5 dakikada 200 sembol taranır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Tarama evreni yalnızca adı Common Stock / Common Shares olan aktif NYSE, NASDAQ ve NYSE American adi hisseleridir. ETF, kaldıraçlı/ters fon, varant, imtiyazlı pay, birim ve tahvil benzeri varlıklar dışarıda bırakılır. Alış için 20 günlük ortalama dolar hacmi en az 10 milyon USD ve en az 220 günlük fiyat geçmişi gerekir. Her 5 dakikada 200 sembol taranır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         # Midas benzeri mum grafiği: fiyat, EMA20/50 ve hacim.
         chart_controls=tk.Frame(chart,bg=bg,padx=15,pady=12); chart_controls.pack(fill="x")
         tk.Label(chart_controls,text="Hisse kodu",bg=bg,fg="white").pack(side="left")
@@ -429,11 +521,38 @@ class App:
         self.price_canvas=tk.Canvas(chart,bg="#0b1220",highlightthickness=0); self.price_canvas.pack(fill="both",expand=True,padx=12,pady=12)
         self.price_canvas.bind("<Configure>",lambda e:self.draw_price_chart())
         self.chart_rows=[]; self.chart_name=""; self.chart_timeframe="1Day"
+        btbar=tk.Frame(backtest,bg=bg,padx=18,pady=18); btbar.pack(fill="x")
+        tk.Label(btbar,text="ABD hisse kodu",bg=bg,fg="white").pack(side="left")
+        self.backtest_symbol=tk.Entry(btbar,width=12,font=("Segoe UI",11)); self.backtest_symbol.insert(0,"AAPL"); self.backtest_symbol.pack(side="left",padx=8)
+        tk.Button(btbar,text="3 YILLIK TESTİ ÇALIŞTIR",command=self.run_backtest,bg=green,fg="#07131a",relief="flat",padx=16,pady=8).pack(side="left",padx=8)
+        tk.Label(backtest,text="Bu test geçmiş günlük veride, ertesi gün açılışında işlem varsayımı ve işlem başına %0,10 kayma varsayımıyla çalışır. Geçmiş performans geleceği garanti etmez; tek hisse testi bütün tarama evrenini temsil etmez.",bg=bg,fg="#9caec1",wraplength=920,justify="left").pack(anchor="w",padx=18,pady=5)
+        self.backtest_output=tk.Text(backtest,bg="#09111d",fg="#dbe5ef",font=("Consolas",11),relief="flat",height=18)
+        self.backtest_output.pack(fill="both",expand=True,padx=18,pady=16)
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
         for col,title,width in [("time","ZAMAN",180),("symbol","HİSSE",100),("side","YÖN",100),("qty","ADET",100),("status","DURUM",180)]:
             self.tree.heading(col,text=title); self.tree.column(col,width=width,anchor="center")
         self.tree.pack(fill="both",expand=True,padx=15,pady=15)
         tk.Button(history,text="İŞLEMLERİ YENİLE",command=self.refresh_history).pack(anchor="e",padx=15,pady=10)
+    def run_backtest(self):
+        if not self.broker:
+            messagebox.showinfo("Bağlantı","Önce Alpaca Paper bağlantısını test et.")
+            return
+        symbol=self.backtest_symbol.get().strip().upper()
+        if not symbol or not symbol.isalnum():
+            messagebox.showwarning("Hisse kodu","Geçerli bir hisse kodu gir.")
+            return
+        self.backtest_output.delete("1.0","end")
+        self.backtest_output.insert("end",f"{symbol} için 3 yıllık tarihsel test verisi indiriliyor...\n")
+        def work():
+            try:
+                rows=self.broker.history(symbol,"1Day",1100)
+                spy_rows=self.broker.history("SPY","1Day",1100)
+                result=backtest_strategy(rows,spy_rows)
+                self.events.put(("backtest",(symbol,result)))
+            except Exception as exc:
+                self.events.put(("backtest_error",str(exc)))
+        threading.Thread(target=work,daemon=True).start()
+
     def refresh_portfolio(self):
         if not self.broker:
             return
@@ -577,6 +696,19 @@ class App:
                 kind,value=self.events.get_nowait()
                 if kind=="log": self.add_log(value)
                 elif kind=="portfolio": self.draw_portfolio_history(value)
+                elif kind=="backtest":
+                    symbol,result=value
+                    pf="∞" if math.isinf(result["profit_factor"]) else f"{result['profit_factor']:.2f}"
+                    report=(f"SEMBOL: {symbol} | DÖNEM: yaklaşık 3 yıl | BAŞLANGIÇ: USD {result['initial']:,.2f}\n"
+                        f"TEST SONU ÖZKAYNAK: USD {result['final']:,.2f} | NET GETİRİ: {result['return_pct']:.2f}%\n"
+                        f"İŞLEM SAYISI: {result['trades']} | KAZANMA ORANI: {result['win_rate']:.1f}%\n"
+                        f"PROFIT FACTOR: {pf} | MAKS. DÜŞÜŞ: {result['max_drawdown']:.2f}%\n"
+                        f"AYNI DÖNEM HİSSE AL-TUT GETİRİSİ: {result['benchmark']:.2f}%\n"
+                        f"İŞLEM BAŞINA ORT. K/Z: USD {result['avg_trade']:.2f}\n\n"
+                        "Not: Tek hisse üzerinde tarihsel simülasyondur. Emir defteri, temettü, vergi ve tüm piyasa etkileri eksiksiz modellenmez; canlı sonuç garantisi değildir.\n")
+                    self.backtest_output.delete("1.0","end"); self.backtest_output.insert("end",report)
+                elif kind=="backtest_error":
+                    self.backtest_output.insert("end","TEST HATASI: "+value+"\n")
                 elif kind=="chart_error": self.chart_status.configure(text="Grafik yüklenemedi: "+value)
                 elif kind=="chart":
                     self.chart_name,self.chart_rows,self.chart_timeframe=value
@@ -585,15 +717,16 @@ class App:
                 elif kind=="connected":
                     self.broker,account,saved=value; self.connection.configure(text="● ALPACA PAPER BAĞLI",fg="#36c99a")
                     self.result.configure(text=f"Bağlantı başarılı | Hesap: {account.get('status')} | Sanal bakiye: USD {float(account.get('equity',0)):,.2f} | API: {'GÜVENLİ KAYDEDİLDİ' if saved else 'KAYDEDİLEMEDİ'}",fg="#36c99a" if saved else "#ffc36d")
-                    self.metrics["equity"].configure(text=f"USD {float(account.get('equity',0)):,.2f}"); self.metrics["cash"].configure(text=f"USD {float(account.get('cash',0)):,.2f}")
+                    self.metrics["equity"].configure(text=f"USD {float(account.get('equity',0)):,.2f}"); self.metrics["cash"].configure(text=f"USD {float(account.get('cash',0)):,.2f}"); last=float(account.get("last_equity",account.get("equity",0)) or 0); eq=float(account.get("equity",0) or 0); self.metrics["daily"].configure(text=f"{((eq-last)/last*100) if last else 0:+.2f}%")
                     self.test_button.configure(state="normal"); self.add_log("Alpaca Paper bağlantısı doğrulandı." if saved else "Bağlantı doğrulandı ancak API anahtarları güvenli kaydedilemedi."); self.refresh_portfolio()
                 elif kind=="error":
                     self.result.configure(text="Bağlantı hatası: "+value,fg="#ff7373"); self.test_button.configure(state="normal"); messagebox.showerror("Alpaca",value)
                 elif kind=="decision":
                     sym,action,score,price,rsi=value; self.add_log(f"{sym} | {action} | skor {score:.2f} | USD {price:.2f} | RSI {rsi:.1f}")
                 elif kind=="status":
-                    n,count,equity,cash,positions,market=value
-                    self.metrics["equity"].configure(text=f"USD {equity:,.2f}"); self.metrics["cash"].configure(text=f"USD {cash:,.2f}"); self.metrics["positions"].configure(text=str(positions))
+                    n,count,equity,cash,positions,market,daily,managed=value
+                    self.metrics["equity"].configure(text=f"USD {equity:,.2f}"); self.metrics["cash"].configure(text=f"USD {cash:,.2f}"); self.metrics["positions"].configure(text=f"{managed}/5")
+                    self.metrics["daily"].configure(text=f"{daily*100:+.2f}%")
                     self.market.configure(text=f"Piyasa: {'Açık' if market else 'Kapalı'} | Hisse evreni: {n} | Bu tur: {count}")
                 elif kind=="history":
                     for item in self.tree.get_children(): self.tree.delete(item)
