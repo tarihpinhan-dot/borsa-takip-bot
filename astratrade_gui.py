@@ -38,8 +38,15 @@ class Alpaca:
     def news(self, symbols):
         start = (datetime.now(timezone.utc)-timedelta(hours=24)).isoformat()
         return self.call(DATA, "/v1beta1/news", {"symbols":",".join(symbols),"start":start,"limit":50})
-    def order(self, symbol, qty, side):
+    def order(self, symbol, qty, side, take_profit=None, stop_loss=None):
         body = {"symbol":symbol,"qty":str(qty),"side":side,"type":"market","time_in_force":"day"}
+        if side == "buy" and take_profit is not None and stop_loss is not None:
+            body.update({
+                "time_in_force":"gtc",
+                "order_class":"bracket",
+                "take_profit":{"limit_price":f"{take_profit:.2f}"},
+                "stop_loss":{"stop_price":f"{stop_loss:.2f}"}
+            })
         req = urllib.request.Request(PAPER+"/v2/orders", data=json.dumps(body).encode(), headers=self.headers, method="POST")
         with urllib.request.urlopen(req, timeout=25) as r: return json.loads(r.read().decode())
 
@@ -90,12 +97,15 @@ class Bot:
             if len(batch)<30: batch+=symbols[:30-len(batch)]
             try:
                 bars=self.broker.bars(batch).get("bars",{})
+                data_symbols=len(bars)
+                sufficient_history=sum(1 for rows in bars.values() if len(rows)>=55)
                 try: sentiments=news_score(self.broker.news(batch).get("news",[]))
                 except Exception: sentiments={}
                 positions=self.broker.positions(); held={p["symbol"]:p for p in positions}
                 pending={o["symbol"] for o in self.broker.open_orders()}
                 account=self.broker.account(); clock=self.broker.call(PAPER,"/v2/clock")
-                equity=float(account["equity"]); last=float(account.get("last_equity",equity))
+                equity=float(account["equity"]); cash=float(account.get("cash",0))
+                last=float(account.get("last_equity",equity))
                 daily=(equity-last)/last if last else 0
                 scanned=0
                 for sym in batch:
@@ -111,17 +121,25 @@ class Bot:
                     if not clock.get("is_open") or sym in pending: continue
                     if action=="BUY" and sym not in held and len(held)<5 and daily>-.02:
                         distance=max(1.5*f["atr"],f["price"]*.01)
-                        qty=max(0,min(int(equity*.005/distance),int(equity*.10/f["price"])))
+                        if distance >= f["price"]*.80:
+                            continue
+                        qty=max(0,min(int(equity*.005/distance),int(equity*.10/f["price"]),int(max(cash,0)*.98/f["price"])))
                         if qty:
-                            result=self.broker.order(sym,qty,"buy"); pending.add(sym)
-                            self.events.put(("log",f"SANAL ALIM {sym} x{qty} | skor {score:.2f} | {result.get('status')}"))
+                            stop_price=round(f["price"]-distance,2)
+                            take_profit_price=round(f["price"]+2*distance,2)
+                            result=self.broker.order(sym,qty,"buy",take_profit=take_profit_price,stop_loss=stop_price)
+                            pending.add(sym)
+                            held[sym]={"symbol":sym,"qty":str(qty)}
+                            cash=max(0.0,cash-qty*f["price"])
+                            self.events.put(("log",f"SANAL ALIM {sym} x{qty} | skor {score:.2f} | SL {stop_price:.2f} | TP {take_profit_price:.2f} | {result.get('status')}"))
                     elif action=="SELL" and sym in held:
                         qty=abs(float(held[sym]["qty"]))
                         if qty:
                             result=self.broker.order(sym,qty,"sell"); pending.add(sym)
                             self.events.put(("log",f"SANAL SATIŞ {sym} x{qty:g} | {result.get('status')}"))
                 self.events.put(("status",(len(symbols),scanned,equity,float(account["cash"]),len(held),bool(clock.get("is_open")))))
-                self.events.put(("log",f"Tarama tamamlandı: {scanned} hisse. Piyasa: {'açık' if clock.get('is_open') else 'kapalı'}."))
+                self.events.put(("log",f"Veri yanıtı: {data_symbols}/{len(batch)} sembol; en az 55 günlük geçmişi olan: {sufficient_history}."))
+                self.events.put(("log",f"Tarama tamamlandı: {scanned} hisse analiz edildi. Piyasa: {'açık' if clock.get('is_open') else 'kapalı'}; {'emir gönderimi mümkün' if clock.get('is_open') else 'yeni emir gönderilmedi'}."))
             except Exception as exc: self.events.put(("log","Tarama hatası: "+str(exc)))
             self.stop.wait(900)
         self.events.put(("log","Bot durduruldu."))
@@ -135,7 +153,7 @@ class App:
         bg="#111827"; panel="#1f2d42"; green="#36c99a"
         head=tk.Frame(self.root,bg=bg); head.pack(fill="x",padx=20,pady=18)
         tk.Label(head,text="ASTRATRADE AI",bg=bg,fg="white",font=("Segoe UI",22,"bold")).pack(side="left")
-        tk.Label(head,text="US EQUITIES • PAPER TRADING",bg=bg,fg=green).pack(side="left",padx=15)
+        tk.Label(head,text="US EQUITIES • PAPER ONLY • RULE-BASED",bg=bg,fg=green).pack(side="left",padx=15)
         self.connection=tk.Label(head,text="● BAĞLI DEĞİL",bg=bg,fg="#ffc36d"); self.connection.pack(side="right")
         tabs=ttk.Notebook(self.root); tabs.pack(fill="both",expand=True,padx=20,pady=(0,15)); self.tabs=tabs
         home=tk.Frame(tabs,bg=bg); settings=tk.Frame(tabs,bg=bg); history=tk.Frame(tabs,bg=bg)
@@ -160,7 +178,9 @@ class App:
         tk.Label(box,text="Paper Secret Key",bg=panel,fg="white").pack(anchor="w"); self.secret=tk.Entry(box,show="*",font=("Consolas",10)); self.secret.pack(fill="x",pady=5)
         self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
-        tk.Label(settings,text="Aktif ve işlem yapılabilir ABD hisseleri taranır. Her çevrimde 30 sembol. Veri kaynağı IEX.",bg=bg,fg="#9caec1").pack(anchor="w",padx=20,pady=15)
+        tk.Label(settings,text="Strateji: EMA / RSI / MACD ve basit haber kelime puanlaması; bu sürüm makine öğrenmesi modeli değildir.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
+        tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz; en fazla 5 pozisyon ve işlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Her çevrimde 30 sembol taranır; tüm evrenin dolaşılması zaman alır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
         for col,title,width in [("time","ZAMAN",180),("symbol","HİSSE",100),("side","YÖN",100),("qty","ADET",100),("status","DURUM",180)]:
             self.tree.heading(col,text=title); self.tree.column(col,width=width,anchor="center")
