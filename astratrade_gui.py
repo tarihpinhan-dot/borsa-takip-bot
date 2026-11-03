@@ -35,27 +35,29 @@ class Alpaca:
     def clock(self): return self.call(PAPER, "/v2/clock")
     def open_orders(self): return self.call(PAPER, "/v2/orders", {"status":"open","limit":500})
     def bars(self, symbols):
-        # Alpaca defaults to the current day if start is omitted. Request a full year
-        # so EMA/RSI/MACD have enough daily history. The endpoint limit is total bars,
-        # not bars per symbol, so follow page tokens and merge all symbol rows.
-        params = {
-            "symbols": ",".join(symbols),
-            "timeframe": "1Day",
-            "limit": 10000,
-            "feed": "iex",
-            "start": (datetime.now(timezone.utc) - timedelta(days=365)).isoformat(),
-            "end": datetime.now(timezone.utc).isoformat(),
-            "sort": "asc"
-        }
+        # Alpaca's limit is shared across all symbols in a request and results are
+        # ordered by symbol. Keep each request small enough to fit one year of daily
+        # bars for every symbol, then still follow any unexpected page token.
         collected = {}
-        for _ in range(10):
-            page = self.call(DATA, "/v2/stocks/bars", params)
-            for symbol, rows in page.get("bars", {}).items():
-                collected.setdefault(symbol, []).extend(rows)
-            token = page.get("next_page_token")
-            if not token:
-                break
-            params["page_token"] = token
+        for offset in range(0, len(symbols), 20):
+            chunk = symbols[offset:offset + 20]
+            params = {
+                "symbols": ",".join(chunk),
+                "timeframe": "1Day",
+                "limit": 10000,
+                "feed": "iex",
+                "start": (datetime.now(timezone.utc) - timedelta(days=365)).isoformat(),
+                "end": datetime.now(timezone.utc).isoformat(),
+                "sort": "asc"
+            }
+            for _ in range(5):
+                page = self.call(DATA, "/v2/stocks/bars", params)
+                for symbol, rows in page.get("bars", {}).items():
+                    collected.setdefault(symbol, []).extend(rows)
+                token = page.get("next_page_token")
+                if not token:
+                    break
+                params["page_token"] = token
         return {"bars": collected}
     def news(self, symbols):
         start = (datetime.now(timezone.utc)-timedelta(hours=24)).isoformat()
@@ -121,8 +123,11 @@ class Bot:
             offset=(offset+batch_size)%len(symbols)
             try:
                 bars=self.broker.bars(batch).get("bars",{})
-                data_symbols=len(bars)
-                sufficient_history=sum(1 for rows in bars.values() if len(rows)>=55)
+                bar_counts={sym:len(bars.get(sym,[])) for sym in batch}
+                data_symbols=sum(1 for count in bar_counts.values() if count>0)
+                sufficient_history=sum(1 for count in bar_counts.values() if count>=55)
+                total_daily_bars=sum(bar_counts.values())
+                samples=", ".join(f"{sym}:{bar_counts[sym]}" for sym in batch[:8])
                 try: sentiments=news_score(self.broker.news(batch).get("news",[]))
                 except Exception: sentiments={}
                 positions=self.broker.positions(); held={p["symbol"]:p for p in positions}
@@ -162,7 +167,12 @@ class Bot:
                             result=self.broker.order(sym,qty,"sell"); pending.add(sym)
                             self.events.put(("log",f"SANAL SATIŞ {sym} x{qty:g} | {result.get('status')}"))
                 self.events.put(("status",(len(symbols),scanned,equity,float(account["cash"]),len(held),bool(clock.get("is_open")))))
-                self.events.put(("log",f"Veri yanıtı: {data_symbols}/{len(batch)} sembol; en az 55 günlük geçmişi olan: {sufficient_history}."))
+                self.events.put(("log",f"Veri yanıtı: {data_symbols}/{len(batch)} sembol; toplam günlük bar: {total_daily_bars}; en az 55 günlük geçmişi olan: {sufficient_history}."))
+                self.events.put(("log",f"Veri örneği (sembol:bar): {samples}"))
+                if data_symbols == 0:
+                    self.events.put(("log","VERİ UYARISI: IEX akışından bu gruptaki semboller için bar gelmedi. Paper API anahtarı çalışsa bile piyasa verisi erişimini ayrıca kontrol etmek gerekiyor."))
+                elif sufficient_history == 0:
+                    self.events.put(("log","VERİ UYARISI: Veri geldi ancak 55 günlük analiz için yeterli geçmiş yok."))
                 self.events.put(("log",f"Tarama tamamlandı: {scanned} hisse analiz edildi. Piyasa: {'açık' if clock.get('is_open') else 'kapalı'}; {'emir gönderimi mümkün' if clock.get('is_open') else 'yeni emir gönderilmedi'}."))
             except Exception as exc: self.events.put(("log","Tarama hatası: "+str(exc)))
             self.stop.wait(scan_interval)
@@ -204,7 +214,7 @@ class App:
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
         tk.Label(settings,text="Strateji: EMA / RSI / MACD ve basit haber kelime puanlaması; bu sürüm makine öğrenmesi modeli değildir.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
         tk.Label(settings,text="Alışlar için Alpaca bracket emriyle yaklaşık 1,5 ATR zarar-kes ve 2R kâr-al seviyesi gönderilir. Nakit bakiyesi dışına çıkılmaz; en fazla 5 pozisyon ve işlem başına yaklaşık %0,5 risk hedeflenir. Bu korumalar kaybı garanti olarak sınırlamaz.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
-        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Son 1 yıllık günlük bar verisi kullanılır; sayfalı yanıtlar birleştirilir. Her 5 dakikada 200 sembol taranır. 13.194 sembollük evrenin tam turu yaklaşık 5,5 saat sürer. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="Ücretsiz veri IEX akışıdır. Son 1 yıllık günlük veriler 20'şer sembollük isteklerle alınır; böylece Alpaca'nın 10.000 toplam bar sınırı aşılmaz. Her 5 dakikada 200 sembol taranır. Veri sayıları faaliyet kayıtlarına yazılır. Gerçek para hesabı bu sürümde desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
         for col,title,width in [("time","ZAMAN",180),("symbol","HİSSE",100),("side","YÖN",100),("qty","ADET",100),("status","DURUM",180)]:
             self.tree.heading(col,text=title); self.tree.column(col,width=width,anchor="center")
