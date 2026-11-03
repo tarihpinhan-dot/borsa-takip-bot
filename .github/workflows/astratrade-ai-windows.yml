@@ -6,6 +6,11 @@ on:
       - 'astratrade_gui.py'
       - 'tests/**'
       - '.github/workflows/astratrade-ai-windows.yml'
+  pull_request:
+    paths:
+      - 'astratrade_gui.py'
+      - 'tests/**'
+      - '.github/workflows/astratrade-ai-windows.yml'
 permissions:
   contents: write
 jobs:
@@ -28,7 +33,7 @@ jobs:
           retention-days: 30
 
       - name: Record build metadata
-        if: always()
+        if: always() && github.event_name == 'push'
         shell: pwsh
         run: |
           $status = [ordered]@{
