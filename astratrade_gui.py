@@ -154,8 +154,10 @@ class Alpaca:
         return rows
 
     def portfolio_history(self):
+        # Alpaca accepts market_hours / extended_hours / continuous.
+        # Omitting intraday_reporting avoids the invalid "market" value (HTTP 422).
         return self.call(PAPER, "/v2/account/portfolio/history", {
-            "period": "1M", "timeframe": "1D", "intraday_reporting": "market"
+            "period": "1M", "timeframe": "1D"
         })
     def order(self, symbol, qty, side, take_profit=None, stop_loss=None):
         body = {"symbol":symbol,"qty":str(qty),"side":side,"type":"market","time_in_force":"day","client_order_id":f"astra-{symbol.lower()}-{int(time.time())}"}
@@ -412,6 +414,8 @@ class Bot:
                 if not risk_allowed:
                     self.events.put(("log", "RİSK KİLİDİ: Günlük %1,5 zarar veya portföy zirvesinden %5 düşüş sınırı aşıldı; yeni alışlar durduruldu. Satış/çıkış sinyalleri izlenmeye devam ediyor."))
                 scanned = 0
+                best_score = 0.0
+                buy_signal_count = 0
                 for sym in batch:
                     if self.stop.is_set():
                         break
@@ -419,6 +423,9 @@ class Bot:
                     if not f or f["price"] < 5:
                         continue
                     action = f["action"]
+                    best_score = max(best_score, f["score"])
+                    if action == "BUY":
+                        buy_signal_count += 1
                     if action == "BUY" and f["dollar_vol"] < 10_000_000:
                         action = "HOLD"
                     scanned += 1
@@ -456,6 +463,7 @@ class Bot:
                             self.events.put(("log", f"ASTRATRADE PAPER ÇIKIŞ {sym} x{qty:g} | {result.get('status')}"))
                 self.events.put(("status", (len(symbols), scanned, equity, cash, len(held), bool(clock.get("is_open")), daily_return, len(managed_active))))
                 data_symbols = sum(1 for count in bar_counts.values() if count > 0)
+                self.events.put(("log", f"Tarama kalitesi: {scanned} analiz içinde en yüksek skor {best_score:.2f}/1,00; BUY sinyali {buy_signal_count}. Alış eşiği 0,86 (7 koşulun en az 6'sı) ve SPY filtresi {'olumlu' if market_ok else 'olumsuz'}." ))
                 self.events.put(("log", f"Veri: {data_symbols}/{len(batch)} sembol; {total_daily_bars} günlük bar; 220+ bar geçmişi olan: {sufficient_history}. SPY piyasa filtresi: {'OLUMLU' if market_ok else 'OLUMSUZ'}."))
                 self.events.put(("log", f"Veri örneği: {samples}"))
                 if data_symbols == 0:
@@ -750,7 +758,7 @@ class App:
                     self.broker,account,saved=value; self.connection.configure(text="● ALPACA PAPER BAĞLI",fg="#36c99a")
                     self.result.configure(text=f"Bağlantı başarılı | Hesap: {account.get('status')} | Sanal bakiye: USD {float(account.get('equity',0)):,.2f} | API: {'GÜVENLİ KAYDEDİLDİ' if saved else 'KAYDEDİLEMEDİ'}",fg="#36c99a" if saved else "#ffc36d")
                     self.metrics["equity"].configure(text=f"USD {float(account.get('equity',0)):,.2f}"); self.metrics["cash"].configure(text=f"USD {float(account.get('cash',0)):,.2f}"); last=float(account.get("last_equity",account.get("equity",0)) or 0); eq=float(account.get("equity",0) or 0); self.metrics["daily"].configure(text=f"{((eq-last)/last*100) if last else 0:+.2f}%")
-                    self.test_button.configure(state="normal"); self.add_log("Alpaca Paper bağlantısı doğrulandı." if saved else "Bağlantı doğrulandı ancak API anahtarları güvenli kaydedilemedi."); self.refresh_portfolio(); self.refresh_positions()
+                    self.test_button.configure(state="normal"); self.add_log("Alpaca Paper bağlantısı doğrulandı; API anahtarları Windows üzerinde güvenli kaydedildi." if saved else "Bağlantı doğrulandı ancak API anahtarları güvenli kaydedilemedi."); self.refresh_portfolio(); self.refresh_positions()
                 elif kind=="error":
                     self.result.configure(text="Bağlantı hatası: "+value,fg="#ff7373"); self.test_button.configure(state="normal"); messagebox.showerror("Alpaca",value)
                 elif kind=="decision":
