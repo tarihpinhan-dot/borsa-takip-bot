@@ -389,6 +389,12 @@ class AstraTradeIntradayTests(unittest.TestCase):
         self.assertEqual(len(stale_rows), 60)
         self.assertFalse(stale)
 
+    def test_15m_aggregation_ignores_an_incomplete_last_bucket(self):
+        six_rows = make_intraday_bars(6)
+        five_rows = make_intraday_bars(5)
+        self.assertEqual(len(app.aggregate_15m(six_rows)), 2)
+        self.assertEqual(len(app.aggregate_15m(five_rows)), 1)
+
     def test_intraday_analyzer_requires_enough_bars_and_returns_indicator_detail(self):
         daily = make_bars(260)
         for item in daily:
