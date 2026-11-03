@@ -698,8 +698,18 @@ class Bot:
                 # Recover those IDs when upgrading from an earlier AstraTrade build.
                 for order in open_orders:
                     symbol = order.get("symbol")
+                    if not symbol:
+                        continue
+                    # Recover an entry accepted by Alpaca just before a prior app shutdown.
+                    if str(order.get("side", "")).lower() == "buy" and str(order.get("client_order_id", "")).startswith("astra-"):
+                        self.managed_symbols.add(symbol)
                     if symbol in self.managed_symbols and order.get("group_id") and order.get("group_role") in ("take_profit", "stop_loss"):
                         self.managed_groups[symbol] = str(order["group_id"])
+                        protection = self.managed_protection.setdefault(symbol, {})
+                        if order.get("group_role") == "take_profit" and order.get("limit_price"):
+                            protection["take_profit"] = float(order["limit_price"])
+                        elif order.get("group_role") == "stop_loss" and order.get("stop_price"):
+                            protection["stop_loss"] = float(order["stop_price"])
 
                 active_symbols = set(held) | pending
                 removed_symbols = self.managed_symbols - active_symbols
