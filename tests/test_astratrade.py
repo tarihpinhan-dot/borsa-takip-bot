@@ -445,14 +445,14 @@ class AstraTradeIntradayTests(unittest.TestCase):
             "conditions": {str(i): True for i in range(7)}
         }
         broker = IntradayBroker()
-        with tempfile.TemporaryDirectory() as tmp, \\
-             patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \\
-             patch.object(app, "load_managed_symbols", return_value=set()), \\
-             patch.object(app, "load_managed_groups", return_value={}), \\
-             patch.object(app, "load_managed_protection", return_value={}), \\
-             patch.object(app, "analyze_intraday", return_value=signal):
-            bot = app.Bot(broker, queue_for_test(), OneCycleStop())
-            bot.run()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+                 patch.object(app, "load_managed_symbols", return_value=set()), \
+                 patch.object(app, "load_managed_groups", return_value={}), \
+                 patch.object(app, "load_managed_protection", return_value={}), \
+                 patch.object(app, "analyze_intraday", return_value=signal):
+                bot = app.Bot(broker, queue_for_test(), OneCycleStop())
+                bot.run()
         self.assertEqual(len(broker.sent), 1)
         symbol, qty, side, tp, sl = broker.sent[0]
         self.assertEqual(symbol, "AAPL")
