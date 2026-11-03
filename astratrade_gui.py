@@ -1573,8 +1573,8 @@ class App:
         btbar=tk.Frame(backtest,bg=bg,padx=18,pady=18); btbar.pack(fill="x")
         tk.Label(btbar,text="ABD hisse kodu",bg=bg,fg="white").pack(side="left")
         self.backtest_symbol=tk.Entry(btbar,width=12,font=("Segoe UI",11)); self.backtest_symbol.insert(0,"AAPL"); self.backtest_symbol.pack(side="left",padx=8)
-        tk.Button(btbar,text="3 YILLIK TESTİ ÇALIŞTIR",command=self.run_backtest,bg=green,fg="#07131a",relief="flat",padx=16,pady=8).pack(side="left",padx=8)
-        tk.Label(backtest,text="Bu test geçmiş günlük veride, ertesi gün açılışında işlem varsayımı ve işlem başına %0,10 kayma varsayımıyla çalışır. Geçmiş performans geleceği garanti etmez; tek hisse testi bütün tarama evrenini temsil etmez.",bg=bg,fg="#9caec1",wraplength=920,justify="left").pack(anchor="w",padx=18,pady=5)
+        tk.Button(btbar,text="30 GÜNLÜK 5 DK TESTİ ÇALIŞTIR",command=self.run_backtest,bg=green,fg="#07131a",relief="flat",padx=16,pady=8).pack(side="left",padx=8)
+        tk.Label(backtest,text="Bu test yaklaşık 30 günlük 5 dakikalık IEX mumları ve %0,10 giriş/çıkış kayması varsayımıyla çalışır. Tek hisse simülasyonudur; tüm evreni, emir kuyruğunu, spreadi ve gerçek kısmi dolumları tam modellemez. Geçmiş performans geleceği garanti etmez.",bg=bg,fg="#9caec1",wraplength=920,justify="left").pack(anchor="w",padx=18,pady=5)
         self.backtest_output=tk.Text(backtest,bg="#09111d",fg="#dbe5ef",font=("Consolas",11),relief="flat",height=18)
         self.backtest_output.pack(fill="both",expand=True,padx=18,pady=16)
         self.tree=ttk.Treeview(history,columns=("time","symbol","side","qty","status"),show="headings")
@@ -1595,24 +1595,20 @@ class App:
 
     def run_backtest(self):
         if not self.broker:
-            messagebox.showinfo("Bağlantı","Önce Alpaca Paper bağlantısını test et.")
+            messagebox.showinfo("Bağlantı","Önce Alpaca Paper bağlantısına bağlan.")
             return
         symbol=self.backtest_symbol.get().strip().upper()
         if not symbol or not symbol.isalnum():
             messagebox.showwarning("Hisse kodu","Geçerli bir hisse kodu gir.")
             return
         self.backtest_output.delete("1.0","end")
-        self.backtest_output.insert("end",f"{symbol} için 3 yıllık tarihsel test verisi indiriliyor...\n")
+        self.backtest_output.insert("end",f"{symbol} için yaklaşık 30 günlük 5 dakikalık test verisi indiriliyor...\n")
         def work():
             try:
-                rows=self.broker.history(symbol,"1Day",1100,adjustment="split")
-                spy_rows=self.broker.history("SPY","1Day",1100,adjustment="split")
-                clock=self.broker.clock()
-                market_day=str(clock.get("timestamp",""))[:10]
-                if clock.get("is_open"):
-                    if rows and str(rows[-1].get("t",""))[:10] == market_day: rows=rows[:-1]
-                    if spy_rows and str(spy_rows[-1].get("t",""))[:10] == market_day: spy_rows=spy_rows[:-1]
-                result=backtest_strategy(rows,spy_rows)
+                intraday=self.broker.history(symbol,"5Min",35,adjustment="raw")
+                daily=self.broker.history(symbol,"1Day",400,adjustment="split")
+                spy_daily=self.broker.history("SPY","1Day",400,adjustment="split")
+                result=backtest_intraday_strategy(intraday,daily,spy_daily)
                 self.events.put(("backtest",(symbol,result)))
             except Exception as exc:
                 self.events.put(("backtest_error",str(exc)))
@@ -1770,13 +1766,13 @@ class App:
                 elif kind=="backtest":
                     symbol,result=value
                     pf="∞" if math.isinf(result["profit_factor"]) else f"{result['profit_factor']:.2f}"
-                    report=(f"SEMBOL: {symbol} | DÖNEM: yaklaşık 3 yıl | BAŞLANGIÇ: USD {result['initial']:,.2f}\n"
+                    report=(f"SEMBOL: {symbol} | DÖNEM: yaklaşık 30 gün / 5 dakika | BAŞLANGIÇ: USD {result['initial']:,.2f}\n"
                         f"TEST SONU ÖZKAYNAK: USD {result['final']:,.2f} | NET GETİRİ: {result['return_pct']:.2f}%\n"
                         f"İŞLEM SAYISI: {result['trades']} | KAZANMA ORANI: {result['win_rate']:.1f}%\n"
                         f"PROFIT FACTOR: {pf} | MAKS. DÜŞÜŞ: {result['max_drawdown']:.2f}%\n"
                         f"AYNI HİSSE AL-TUT: {result['benchmark']:.2f}% | SPY AL-TUT: {result['spy_benchmark']:.2f}%\n"
                         f"İŞLEM BAŞINA ORT. K/Z: USD {result['avg_trade']:.2f}\n\n"
-                        "Not: Tek hisse üzerinde yaklaşık tarihsel simülasyondur. Günlük %1,5 intraday kilidi, temettüler, komisyonlar, emir defteri ve piyasa derinliği tam modellenmez. Split-adjusted günlük veri, %0,10 giriş/çıkış kayması ve giriş gününde stop/hedef kontrolü kullanılır; canlı sonuç garantisi değildir.\n")
+                        "Not: Tek hisse üzerinde kısa dönem simülasyondur. Günlük risk kilidi ve gerçek emir kuyruğu/kısmi dolumlar tam modellenmez. %0,10 giriş/çıkış kayması ve aynı mumda stopun hedefe öncelikli olduğu varsayılmıştır; IEX hacmi tüm piyasa hacmini temsil etmez. Canlı sonuç garantisi değildir.\n")
                     self.backtest_output.delete("1.0","end"); self.backtest_output.insert("end",report)
                 elif kind=="backtest_error":
                     self.backtest_output.insert("end","TEST HATASI: "+value+"\n")
