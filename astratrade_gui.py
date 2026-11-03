@@ -586,7 +586,10 @@ class Bot:
             if fresh_position and take_profit > 0 and stop_loss > 0:
                 try:
                     qty = abs(float(fresh_position.get("qty", 0) or 0))
-                    self.broker.restore_oco_protection(symbol, qty, take_profit, stop_loss)
+                    restored = self.broker.restore_oco_protection(symbol, qty, take_profit, stop_loss)
+                    if restored.get("group_id"):
+                        self.managed_groups[symbol] = str(restored["group_id"])
+                        self._save_management_state()
                     self.events.put(("log", f"ÇIKIŞ BAŞARISIZ {symbol}: {exc}. Eski zarar-kes/kâr-al koruması yeniden kuruldu."))
                 except Exception as protect_exc:
                     self.events.put(("log", f"KRİTİK KORUMA HATASI {symbol}: satış başarısız ({exc}); OCO koruması da kurulamadı ({protect_exc}). Bot güvenlik için durduruluyor."))
@@ -883,8 +886,13 @@ class App:
         self.backtest_output.insert("end",f"{symbol} için 3 yıllık tarihsel test verisi indiriliyor...\n")
         def work():
             try:
-                rows=self.broker.history(symbol,"1Day",1100)
-                spy_rows=self.broker.history("SPY","1Day",1100)
+                rows=self.broker.history(symbol,"1Day",1100,adjustment="split")
+                spy_rows=self.broker.history("SPY","1Day",1100,adjustment="split")
+                clock=self.broker.clock()
+                market_day=str(clock.get("timestamp",""))[:10]
+                if clock.get("is_open"):
+                    if rows and str(rows[-1].get("t",""))[:10] == market_day: rows=rows[:-1]
+                    if spy_rows and str(spy_rows[-1].get("t",""))[:10] == market_day: spy_rows=spy_rows[:-1]
                 result=backtest_strategy(rows,spy_rows)
                 self.events.put(("backtest",(symbol,result)))
             except Exception as exc:
