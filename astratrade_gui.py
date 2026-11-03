@@ -150,23 +150,29 @@ class Alpaca:
         params = {"status": "open", "limit": 500, "direction": "asc", "nested": "false"}
         orders = []
         seen_ids = set()
-        for _ in range(20):
+        for page_number in range(21):
+            # Probe once beyond the 10,000-order safety cap, so exactly 10,000
+            # orders is accepted while larger books fail closed.
+            if page_number == 20:
+                params["limit"] = 1
             page = self.call(PAPER, "/v2/orders", params)
             if not isinstance(page, list):
                 raise RuntimeError("Alpaca açık emir listesi beklenen liste biçiminde değil.")
+            if page_number == 20 and page:
+                raise RuntimeError("Açık emir sayısı 10.000 kayıt sınırını aştı; güvenlik için işlem taraması durduruldu.")
             for order in page:
                 order_id = order.get("id")
                 if order_id and order_id not in seen_ids:
                     seen_ids.add(order_id)
                     orders.append(order)
-            if len(page) < 500:
+            if len(page) < params["limit"]:
                 break
             last_id = page[-1].get("id")
             if not last_id:
                 raise RuntimeError("Alpaca emir sayfalamasında son emir kimliği eksik.")
             params["after_order_id"] = last_id
         else:
-            raise RuntimeError("Açık emir sayısı 10.000 kayıt sınırını aştı; güvenlik için işlem taraması durduruldu.")
+            raise RuntimeError("Alpaca emir sayfalaması beklenmeyen şekilde sonlandı; güvenlik için işlem taraması durduruldu.")
         return orders
     def bars(self, symbols):
         # Alpaca's limit is shared across all symbols in a request and results are
