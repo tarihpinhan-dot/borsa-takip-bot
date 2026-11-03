@@ -45,8 +45,16 @@ class FakeBroker:
 
     def close_position(self, symbol):
         self.closed.append(symbol)
+        if getattr(self, "close_error", None):
+            raise RuntimeError(self.close_error)
         self.position_rows = [p for p in self.position_rows if p.get("symbol") != symbol]
         return {"status": "new"}
+
+    def restore_oco_protection(self, symbol, qty, take_profit, stop_loss):
+        if not hasattr(self, "restored"):
+            self.restored = []
+        self.restored.append((symbol, qty, take_profit, stop_loss))
+        return {"group_id": "restored-group", "status": "new"}
 
 
 class AstraTradeCoreTests(unittest.TestCase):
@@ -132,6 +140,139 @@ class AstraTradeCoreTests(unittest.TestCase):
         self.assertEqual(broker.closed, ["AAPL"])
         self.assertEqual([o["id"] for o in broker.orders], ["msft-tp"])
 
+
+    def test_exit_failure_restores_original_oco_protection(self):
+        orders = [
+            {"id": "tp", "symbol": "AAPL", "side": "sell", "group_id": "astra-group", "group_role": "take_profit", "limit_price": "120", "status": "new"},
+            {"id": "sl", "symbol": "AAPL", "side": "sell", "group_id": "astra-group", "group_role": "stop_loss", "stop_price": "90", "status": "held"},
+        ]
+        broker = FakeBroker(orders)
+        broker.close_error = "simulated close rejection"
+        stop = threading.Event()
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
+             patch.object(app, "load_managed_groups", return_value={"AAPL": "astra-group"}), \
+             patch.object(app, "load_managed_protection", return_value={"AAPL": {"take_profit": 120, "stop_loss": 90}}):
+            bot = app.Bot(broker, queue_for_test(), stop)
+            self.assertFalse(bot._close_managed_position("AAPL", broker.open_orders()))
+            self.assertFalse(stop.is_set())
+            self.assertEqual(bot.managed_groups["AAPL"], "restored-group")
+        self.assertEqual(broker.restored, [("AAPL", 10.0, 120.0, 90.0)])
+
+    def test_one_scan_sends_a_sized_bracket_order_when_all_gates_pass(self):
+        class OneCycleStop:
+            def __init__(self):
+                self.stopped = False
+            def is_set(self):
+                return self.stopped
+            def wait(self, seconds):
+                self.stopped = True
+            def set(self):
+                self.stopped = True
+
+        class ScanBroker:
+            def __init__(self):
+                self.sent = []
+                self.rows = make_bars(250)
+                self.rows.append({
+                    "t": "2026-11-03T16:00:00Z",
+                    "o": 101.0, "h": 103.0, "l": 100.0, "c": 102.0, "v": 120000
+                })
+            def account(self):
+                return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
+            def assets(self):
+                return [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "status": "active", "tradable": True}]
+            def bars(self, symbols):
+                return {"bars": {symbol: self.rows for symbol in symbols}}
+            def clock(self):
+                return {"is_open": True, "timestamp": "2026-11-03T16:00:00Z"}
+            def positions(self):
+                return []
+            def open_orders(self):
+                return []
+            def order(self, symbol, qty, side, take_profit=None, stop_loss=None):
+                self.sent.append((symbol, qty, side, take_profit, stop_loss))
+                return {"status": "accepted", "group_id": "scan-group"}
+
+        signal = {
+            "price": 100.0, "ema20": 99.0, "ema50": 95.0, "sma200": 90.0,
+            "macd_hist": 1.0, "rsi": 60.0, "atr": 2.0,
+            "dollar_vol": 20_000_000.0, "relative_volume": 1.2,
+            "prior_20_high": 99.5, "score": 5/6, "action": "BUY",
+            "conditions": {
+                "uzun_trend": True, "trend_sirasi": True, "macd_pozitif": True,
+                "rsi_uygun": True, "20_gun_tepe": True, "hacim_onayi": False
+            }
+        }
+        broker = ScanBroker()
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "load_managed_symbols", return_value=set()), \
+             patch.object(app, "load_managed_groups", return_value={}), \
+             patch.object(app, "load_managed_protection", return_value={}), \
+             patch.object(app, "analyze", return_value=signal):
+            bot = app.Bot(broker, queue_for_test(), OneCycleStop())
+            bot.run()
+        self.assertEqual(len(broker.sent), 1)
+        symbol, qty, side, tp, sl = broker.sent[0]
+        self.assertEqual(symbol, "AAPL")
+        self.assertEqual(qty, 62)
+        self.assertEqual(side, "buy")
+        self.assertGreater(tp, sl)
+        self.assertEqual(bot.managed_symbols, {"AAPL"})
+
+    def test_one_scan_does_not_send_buy_when_market_is_closed(self):
+        class OneCycleStop:
+            def __init__(self):
+                self.stopped = False
+            def is_set(self):
+                return self.stopped
+            def wait(self, seconds):
+                self.stopped = True
+            def set(self):
+                self.stopped = True
+
+        class ScanBroker:
+            def __init__(self):
+                self.sent = []
+                self.rows = make_bars(250)
+            def account(self):
+                return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
+            def assets(self):
+                return [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "status": "active", "tradable": True}]
+            def bars(self, symbols):
+                return {"bars": {symbol: self.rows for symbol in symbols}}
+            def clock(self):
+                return {"is_open": False, "timestamp": "2026-11-03T16:00:00Z"}
+            def positions(self):
+                return []
+            def open_orders(self):
+                return []
+            def order(self, *args, **kwargs):
+                self.sent.append((args, kwargs))
+                return {"status": "accepted"}
+
+        signal = {
+            "price": 100.0, "ema20": 99.0, "ema50": 95.0, "sma200": 90.0,
+            "macd_hist": 1.0, "rsi": 60.0, "atr": 2.0,
+            "dollar_vol": 20_000_000.0, "relative_volume": 1.2,
+            "prior_20_high": 99.5, "score": 5/6, "action": "BUY",
+            "conditions": {
+                "uzun_trend": True, "trend_sirasi": True, "macd_pozitif": True,
+                "rsi_uygun": True, "20_gun_tepe": True, "hacim_onayi": False
+            }
+        }
+        broker = ScanBroker()
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "load_managed_symbols", return_value=set()), \
+             patch.object(app, "load_managed_groups", return_value={}), \
+             patch.object(app, "load_managed_protection", return_value={}), \
+             patch.object(app, "analyze", return_value=signal):
+            bot = app.Bot(broker, queue_for_test(), OneCycleStop())
+            bot.run()
+        self.assertEqual(broker.sent, [])
 
     def test_open_orders_paginates_past_500_and_deduplicates_ids(self):
         broker = app.Alpaca("paper-key", "paper-secret")
