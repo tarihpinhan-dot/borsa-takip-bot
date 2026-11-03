@@ -461,14 +461,14 @@ class Bot:
                         continue
                     if action == "BUY" and market_ok and risk_allowed and sym not in reserved and len(managed_active) < MAX_MANAGED_POSITIONS:
                         distance = max(2.0*f["atr"], live_price*0.015)
-                        if distance <= 0 or distance >= f["price"]*0.25:
+                        if distance <= 0 or distance >= live_price*0.25:
                             continue
                         max_risk_dollars = equity * 0.0025
                         managed_room = max(0.0, equity*0.30-managed_exposure)
                         qty_by_risk = int(max_risk_dollars/distance)
                         qty_by_position = int(equity*0.07/live_price)
                         qty_by_exposure = int(managed_room/live_price)
-                        qty_by_cash = int(max(cash, 0)*0.98/f["price"])
+                        qty_by_cash = int(max(cash, 0)*0.98/live_price)
                         qty = max(0, min(qty_by_risk, qty_by_position, qty_by_exposure, qty_by_cash))
                         if qty:
                             stop_price = round(live_price-distance, 2)
