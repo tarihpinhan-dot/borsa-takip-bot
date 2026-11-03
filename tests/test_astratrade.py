@@ -3,7 +3,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import astratrade_gui as app
 
@@ -345,6 +345,132 @@ class AstraTradeCoreTests(unittest.TestCase):
 def queue_for_test():
     import queue
     return queue.Queue()
+
+
+
+def make_intraday_bars(count=60):
+    rows = []
+    origin = datetime(2026, 11, 3, 14, 30, tzinfo=timezone.utc)  # 09:30 ET
+    price = 100.0
+    for i in range(count):
+        price += 0.02 + (0.01 if i % 4 == 0 else 0.0)
+        stamp = origin + timedelta(minutes=5*i)
+        rows.append({
+            "t": stamp.isoformat().replace("+00:00", "Z"),
+            "o": price - 0.01,
+            "h": price + 0.12,
+            "l": price - 0.12,
+            "c": price,
+            "v": 10000 + (i % 5) * 500
+        })
+    return rows
+
+
+class AstraTradeIntradayTests(unittest.TestCase):
+    def test_intraday_exit_levels_are_short_horizon_and_reject_extreme_volatility(self):
+        levels = app.intraday_exit_levels(100.0, 0.20)
+        self.assertAlmostEqual(levels["stop"], 99.40, places=2)
+        self.assertAlmostEqual(levels["target"], 101.20, places=2)
+        self.assertGreaterEqual(levels["target_distance"] / 100.0, 0.012)
+        self.assertIsNone(app.intraday_exit_levels(100.0, 2.0))
+
+    def test_prepare_intraday_rows_excludes_incomplete_and_stale_data(self):
+        rows = make_intraday_bars(60)
+        last = datetime.fromisoformat(rows[-1]["t"].replace("Z", "+00:00"))
+        fresh_rows, price, fresh = app.prepare_intraday_rows(
+            rows, last + timedelta(minutes=5, seconds=30)
+        )
+        self.assertEqual(len(fresh_rows), 60)
+        self.assertIsNotNone(price)
+        self.assertTrue(fresh)
+        stale_rows, _, stale = app.prepare_intraday_rows(
+            rows, last + timedelta(minutes=20)
+        )
+        self.assertEqual(len(stale_rows), 60)
+        self.assertFalse(stale)
+
+    def test_intraday_analyzer_requires_enough_bars_and_returns_indicator_detail(self):
+        daily = make_bars(260)
+        for item in daily:
+            item["v"] = 500000
+        daily_signal = app.analyze(daily)
+        self.assertIsNone(app.analyze_intraday(make_intraday_bars(59), daily_signal))
+        result = app.analyze_intraday(make_intraday_bars(60), daily_signal)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result["conditions"]), 7)
+        self.assertIn(result["action"], ("BUY", "SELL", "HOLD"))
+
+    def test_intraday_scan_submits_a_tighter_bracket_when_every_gate_passes(self):
+        class OneCycleStop:
+            def __init__(self):
+                self.stopped = False
+            def is_set(self):
+                return self.stopped
+            def wait(self, seconds):
+                self.stopped = True
+            def set(self):
+                self.stopped = True
+
+        class IntradayBroker:
+            def __init__(self):
+                self.sent = []
+                self.daily = make_bars(260)
+                for item in self.daily:
+                    item["v"] = 500000
+                self.intraday = make_intraday_bars(60)
+            def account(self):
+                return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
+            def assets(self):
+                return [{
+                    "symbol": "AAPL", "name": "Apple Inc. Common Stock",
+                    "exchange": "NASDAQ", "status": "active", "tradable": True
+                }]
+            def bars(self, symbols):
+                return {"bars": {symbol: (self.daily if symbol in ("AAPL", "SPY") else []) for symbol in symbols}}
+            def intraday_bars(self, symbols, days=5):
+                return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
+            def clock(self):
+                return {"is_open": True, "timestamp": "2026-11-03T19:31:00Z"}
+            def positions(self):
+                return []
+            def open_orders(self):
+                return []
+            def order(self, symbol, qty, side, take_profit=None, stop_loss=None):
+                self.sent.append((symbol, qty, side, take_profit, stop_loss))
+                return {"status": "new", "group_id": "intraday-test-group"}
+
+        signal = {
+            "price": 101.0, "atr": 0.20, "score": 6/7, "action": "BUY",
+            "daily_uptrend": True, "rsi": 60.0,
+            "conditions": {str(i): True for i in range(7)}
+        }
+        broker = IntradayBroker()
+        with tempfile.TemporaryDirectory() as tmp, \\
+             patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \\
+             patch.object(app, "load_managed_symbols", return_value=set()), \\
+             patch.object(app, "load_managed_groups", return_value={}), \\
+             patch.object(app, "load_managed_protection", return_value={}), \\
+             patch.object(app, "analyze_intraday", return_value=signal):
+            bot = app.Bot(broker, queue_for_test(), OneCycleStop())
+            bot.run()
+        self.assertEqual(len(broker.sent), 1)
+        symbol, qty, side, tp, sl = broker.sent[0]
+        self.assertEqual(symbol, "AAPL")
+        self.assertEqual(side, "buy")
+        self.assertGreater(tp, sl)
+        self.assertLess((tp - sl) / sl, 0.03)
+        self.assertEqual(bot.managed_protection["AAPL"]["strategy"], "intraday_v1")
+        self.assertEqual(bot.managed_protection["AAPL"]["max_hold_minutes"], 60)
+
+    def test_intraday_bars_requests_5_minute_iex_data(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        with patch.object(broker, "call", return_value={"bars": {"AAPL": make_intraday_bars(3)}}) as mocked:
+            broker.intraday_bars(["AAPL"], days=5)
+        params = mocked.call_args.args[2]
+        self.assertEqual(params["timeframe"], "5Min")
+        self.assertEqual(params["feed"], "iex")
+        self.assertEqual(params["limit"], 10000)
+
 
 
 if __name__ == "__main__":
