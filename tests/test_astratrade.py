@@ -367,6 +367,17 @@ def make_intraday_bars(count=60):
 
 
 class AstraTradeIntradayTests(unittest.TestCase):
+    def test_usd_profit_target_setting_changes_position_sizing(self):
+        qty_20 = app.calculate_order_qty(100000, 50000, 100.0, 0.50, 0.0, profit_target_usd=20.0)
+        qty_30 = app.calculate_order_qty(100000, 50000, 100.0, 0.50, 0.0, profit_target_usd=30.0)
+        self.assertEqual(qty_20, 25)
+        self.assertEqual(qty_30, 37)
+        self.assertGreater(qty_30, qty_20)
+        target_20 = app.dollar_profit_limit_price(100.0, qty_20, 20.0)
+        target_30 = app.dollar_profit_limit_price(100.0, qty_30, 30.0)
+        self.assertGreaterEqual(target_20["estimated_gross_profit_usd"], 20.0)
+        self.assertGreaterEqual(target_30["estimated_gross_profit_usd"], 30.0)
+
     def test_dollar_profit_target_limit_price_rounds_up_with_cushion(self):
         target = app.dollar_profit_limit_price(100.0, 25, 20.0)
         self.assertIsNotNone(target)
