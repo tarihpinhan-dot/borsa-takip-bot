@@ -158,7 +158,7 @@ class Alpaca:
             "period": "1M", "timeframe": "1D", "intraday_reporting": "market"
         })
     def order(self, symbol, qty, side, take_profit=None, stop_loss=None):
-        body = {"symbol":symbol,"qty":str(qty),"side":side,"type":"market","time_in_force":"day"}
+        body = {"symbol":symbol,"qty":str(qty),"side":side,"type":"market","time_in_force":"day","client_order_id":f"astra-{symbol.lower()}-{int(time.time())}"}
         if side == "buy" and take_profit is not None and stop_loss is not None:
             body.update({
                 "time_in_force":"gtc",
@@ -272,6 +272,7 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
         day_close = float(day["c"])
         exit_price = None
         exit_reason = ""
+        closed_this_bar = False
         if position:
             # Conservative same-day ambiguity: assume stop is hit before target.
             if day_low <= position["stop"]:
@@ -293,7 +294,8 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
                 trades.append(trade)
                 (wins if pnl > 0 else losses).append(pnl)
                 position = None
-        if not position and signal["action"] == "BUY" and market_ok:
+                closed_this_bar = True
+        if not position and not closed_this_bar and signal["action"] == "BUY" and market_ok:
             entry = day_open * (1+slippage)
             distance = max(2.0*signal["atr"], signal["price"]*0.015)
             if distance > 0 and distance < entry*0.25:
@@ -312,6 +314,9 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
         equity += pnl
         trades.append({"pnl":pnl,"entry":position["entry"],"exit":final_exit,"qty":position["qty"],"reason":"TEST SONU"})
         (wins if pnl > 0 else losses).append(pnl)
+        peak = max(peak, equity)
+        if peak > 0:
+            max_dd = max(max_dd, (peak-equity)/peak)
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
     profit_factor = (gross_profit/gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
@@ -567,7 +572,7 @@ class App:
     def draw_portfolio_history(self,data):
         canvas=self.portfolio_canvas
         canvas.delete("all")
-        values=[float(x) for x in data.get("equity",[]) if x not in (None,"NaN")]
+        values=[float(x) for x in data.get("equity",[]) if x not in (None,"NaN") and math.isfinite(float(x))]
         if len(values)<2:
             canvas.create_text(18,20,anchor="nw",fill="#9caec1",text="Portföy performans grafiği için henüz yeterli veri yok.")
             return
@@ -580,7 +585,7 @@ class App:
             y=top+(bottom-top)*k/3
             val=high-(high-low)*k/3
             canvas.create_line(left,y,right,y,fill="#243247")
-            canvas.create_text(left-8,y,anchor="e",fill="#8294aa",text=f"\${val:,.0f}",font=("Segoe UI",8))
+            canvas.create_text(left-8,y,anchor="e",fill="#8294aa",text=f"${val:,.0f}",font=("Segoe UI",8))
         pts=[]
         for i,val in enumerate(values):
             x=left+(right-left)*i/max(1,len(values)-1)
@@ -629,7 +634,7 @@ class App:
         upper=max(highs); lower=min(lows); pad=(upper-lower)*0.07 or max(upper*0.01,0.1)
         upper+=pad; lower-=pad
         def py(v): return top+(upper-v)/(upper-lower)*(volume_top-top)
-        canvas.create_text(left,12,anchor="nw",fill="#e6edf7",text=f"{self.chart_name}  \${closes[-1]:,.2f}  |  Mum + EMA20 / EMA50 + Hacim",font=("Segoe UI",11,"bold"))
+        canvas.create_text(left,12,anchor="nw",fill="#e6edf7",text=f"{self.chart_name}  ${closes[-1]:,.2f}  |  Mum + EMA20 / EMA50 + Hacim",font=("Segoe UI",11,"bold"))
         for k in range(5):
             val=upper-(upper-lower)*k/4
             y=py(val)
