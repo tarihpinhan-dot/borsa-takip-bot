@@ -504,6 +504,72 @@ class AstraTradeIntradayTests(unittest.TestCase):
         self.assertEqual(bot.managed_protection["AAPL"]["profit_target_usd"], 20.0)
         self.assertGreaterEqual(bot.managed_protection["AAPL"]["estimated_target_profit_usd"], 20.0)
 
+    def test_intraday_bot_closes_its_position_when_usd_profit_target_is_reached(self):
+        class OneCycleStop:
+            def __init__(self):
+                self.stopped = False
+            def is_set(self):
+                return self.stopped
+            def wait(self, seconds):
+                self.stopped = True
+            def set(self):
+                self.stopped = True
+
+        class ProfitExitBroker:
+            def __init__(self):
+                self.position = {
+                    "symbol": "AAPL", "qty": "10", "market_value": "1100",
+                    "unrealized_pl": "20.25"
+                }
+                self.daily = make_bars(260)
+                for row in self.daily:
+                    row["v"] = 500000
+                self.intraday = make_intraday_bars(60)
+                self.closed = []
+            def account(self):
+                return {"equity": "100000", "cash": "90000", "last_equity": "100000"}
+            def assets(self):
+                return [{
+                    "symbol": "AAPL", "name": "Apple Inc. Common Stock",
+                    "exchange": "NASDAQ", "status": "active", "tradable": True
+                }]
+            def bars(self, symbols):
+                return {"bars": {symbol: self.daily for symbol in symbols if symbol in ("AAPL", "SPY")}}
+            def intraday_bars(self, symbols, days=5):
+                return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
+            def clock(self):
+                return {"is_open": True, "timestamp": "2026-11-03T19:31:00Z"}
+            def positions(self):
+                return [self.position] if self.position else []
+            def open_orders(self):
+                return []
+            def close_position(self, symbol):
+                self.closed.append(symbol)
+                self.position = None
+                return {"status": "accepted"}
+
+        broker = ProfitExitBroker()
+        hold_signal = {
+            "price": 110.0, "atr": 0.2, "score": 3/7, "action": "HOLD",
+            "daily_uptrend": True, "rsi": 55.0,
+            "conditions": {str(i): False for i in range(7)}
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+                 patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
+                 patch.object(app, "load_managed_groups", return_value={"AAPL": "old-group"}), \
+                 patch.object(app, "load_managed_protection", return_value={
+                     "AAPL": {
+                         "strategy": "intraday_v1", "profit_target_usd": 20.0,
+                         "opened_at": "2026-11-03T19:00:00Z",
+                         "max_hold_minutes": 45, "take_profit": 120.0, "stop_loss": 100.0
+                     }
+                 }), \
+                 patch.object(app, "analyze_intraday", return_value=hold_signal):
+                bot = app.Bot(broker, queue_for_test(), OneCycleStop(), profit_target_usd=20.0)
+                bot.run()
+        self.assertEqual(broker.closed, ["AAPL"])
+
     def test_intraday_bars_requests_5_minute_iex_data(self):
         broker = app.Alpaca("paper-key", "paper-secret")
         with patch.object(broker, "call", return_value={"bars": {"AAPL": make_intraday_bars(3)}}) as mocked:
