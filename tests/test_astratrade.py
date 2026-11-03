@@ -371,7 +371,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
         levels = app.intraday_exit_levels(100.0, 0.20)
         self.assertAlmostEqual(levels["stop"], 99.50, places=2)
         self.assertAlmostEqual(levels["target"], 100.80, places=2)
-        self.assertGreaterEqual(levels["target_distance"] / 100.0, 0.008)
+        self.assertAlmostEqual(levels["target_distance"] / 100.0, 0.008, places=6)
         self.assertIsNone(app.intraday_exit_levels(100.0, 2.0))
 
     def test_prepare_intraday_rows_excludes_incomplete_and_stale_data(self):
