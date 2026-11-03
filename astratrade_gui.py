@@ -570,7 +570,7 @@ def analyze_intraday(rows, daily_signal):
         "macd_positive": macd_hist > 0,
         "rsi_window": 48 <= rsi <= 72,
         "above_vwap": price > vwap,
-        "12_bar_breakout": price > previous_high,
+        "6_bar_breakout": price > previous_high,
         "relative_volume": relative_volume >= 1.00
     }
     score = sum(bool(value) for value in conditions.values()) / len(conditions)
@@ -1288,7 +1288,7 @@ class Bot:
         )
         self.events.put(("log", f"Kısa vadeli izleme listesi: {len(scan_symbols)} en likit hisse | günlük ortalama dolar hacmi en az USD 20 milyon."))
         self.events.put(("log", "Strateji: 5 dakikalık EMA9/21 + VWAP + MACD + Wilder RSI + 12 mum kırılımı + hacim; 15 dakikalık EMA9/21 teyidi; günlük SMA200 rejim filtresi."))
-        self.events.put(("log", "İşlem planı: hedef en az %1,20; volatiliteye bağlı stop %0,60-%1,20; 45 dakika azami taşıma; 15:45 ET gün sonu kapatma."))
+        self.events.put(("log", "İşlem planı: hedef %0,80-%2,00; volatiliteye bağlı stop %0,50-%1,00; 45 dakika azami taşıma; 15:45 ET gün sonu kapatma."))
         self.events.put(("log", "Risk motoru: işlem başına azami %0,25 risk bütçesi, pozisyon başına %7, yönetilen toplam maruziyet %30, günlük zarar kilidi %1,5, zirveden düşüş kilidi %5."))
 
         while not self.stop.is_set():
@@ -1351,7 +1351,7 @@ class Bot:
                         elapsed_minutes = (now_utc - _parse_utc(opened_at)).total_seconds() / 60
                     except (TypeError, ValueError):
                         elapsed_minutes = 0
-                    max_hold = float(meta.get("max_hold_minutes", 45) or 60)
+                    max_hold = float(meta.get("max_hold_minutes", 45) or 45)
                     if elapsed_minutes >= max_hold or force_flat_time:
                         self.events.put(("log", f"ZAMAN ÇIKIŞI {symbol}: taşıma {elapsed_minutes:.0f} dk; pozisyon kapatılıyor."))
                         if self._close_managed_position(symbol, open_orders):
@@ -1438,17 +1438,10 @@ class Bot:
                             if not qty:
                                 order_blocked["miktar_sifir"] += 1
                                 continue
-                            try:
-                                result = self.broker.order(
-                                    symbol, qty, "buy",
-                                    take_profit=levels["target"], stop_loss=levels["stop"]
-                                )
-                            except Exception as order_error:
-                                self.events.put(("log", f"ALIŞ EMRİ REDDEDİLDİ {symbol}: {order_error}"))
-                                continue
+                            # Persist ownership and intended short-term protection before POSTing.
+                            # This preserves intraday management if the process restarts just after
+                            # Alpaca accepts the entry. A rejected POST rolls the state back.
                             self.managed_symbols.add(symbol)
-                            if result.get("group_id"):
-                                self.managed_groups[symbol] = str(result["group_id"])
                             self.managed_protection[symbol] = {
                                 "take_profit": levels["target"],
                                 "stop_loss": levels["stop"],
@@ -1458,6 +1451,21 @@ class Bot:
                                 "max_hold_minutes": 45,
                                 "entry_price": live_price
                             }
+                            self._save_management_state()
+                            try:
+                                result = self.broker.order(
+                                    symbol, qty, "buy",
+                                    take_profit=levels["target"], stop_loss=levels["stop"]
+                                )
+                            except Exception as order_error:
+                                self.managed_symbols.discard(symbol)
+                                self.managed_groups.pop(symbol, None)
+                                self.managed_protection.pop(symbol, None)
+                                self._save_management_state()
+                                self.events.put(("log", f"ALIŞ EMRİ REDDEDİLDİ {symbol}: {order_error}"))
+                                continue
+                            if result.get("group_id"):
+                                self.managed_groups[symbol] = str(result["group_id"])
                             self._save_management_state()
                             managed_active.add(symbol)
                             reserved.add(symbol)
@@ -1547,8 +1555,8 @@ class App:
         self.test_button=tk.Button(box,text="BAĞLANTIYI TEST ET VE GÜVENLİ KAYDET",command=self.test_connection,bg=green,fg="#07131a",relief="flat",padx=15,pady=9); self.test_button.pack(anchor="w",pady=12)
         tk.Label(box,text="Başarılı bağlantıdan sonra anahtarlar Windows hesabına bağlı DPAPI şifrelemesiyle bu bilgisayarda saklanır ve sonraki açılışta otomatik yüklenir.",bg=panel,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",pady=4)
         self.result=tk.Label(settings,text="Henüz bağlantı test edilmedi.",bg=bg,fg="#9caec1"); self.result.pack(anchor="w",padx=20)
-        tk.Label(settings,text="STRATEJİ: Kısa vadeli gün içi işlem. 5 dakikalık EMA9/21, VWAP, MACD, Wilder RSI, 12 mumluk kırılım ve hacim; 15 dakikalık EMA9/21 yön teyidi; günlük SMA200 ve SPY piyasa rejimi filtresi. İzleme listesi günlük ortalama en az 20 milyon USD dolar hacmine sahip en likit 300 adi hisseden oluşturulur. Sistem makine öğrenmesi değildir; kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
-        tk.Label(settings,text="Yeni gün içi işlemlerde hedef en az %1,20 (hedef/stop oranı en az 1,6); volatiliteye göre stop %0,60-%1,20 aralığında belirlenir. Azami pozisyon süresi 60 dakika, gün sonu kapatma saati 15:45 ET; yeni alış penceresi 09:45-15:00 ET. İşlem başına risk bütçesi %0,25, tek pozisyon %7, toplam yönetilen maruziyet %30. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alış kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlara ve önceden açılmış ADSK gibi eski strateji pozisyonlarına otomatik müdahale edilmez.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
+        tk.Label(settings,text="STRATEJİ: Kısa vadeli gün içi işlem. 5 dakikalık EMA9/21, VWAP, MACD, Wilder RSI, 6 mumluk (30 dk) kırılım ve hacim; 15 dakikalık EMA9/21 yön teyidi; günlük SMA200 ve SPY piyasa rejimi filtresi. İzleme listesi günlük ortalama en az 20 milyon USD dolar hacmine sahip en likit 300 adi hisseden oluşturulur. Sistem makine öğrenmesi değildir; kâr garantisi vermez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=(15,5))
+        tk.Label(settings,text="Yeni gün içi işlemlerde hedef %0,80-%2,00 aralığında (hedef/stop oranı en az 1,6); volatiliteye göre stop %0,50-%1,00 aralığında belirlenir. Azami pozisyon süresi 45 dakika, gün sonu kapatma saati 15:45 ET; yeni alış penceresi 09:45-15:00 ET. İşlem başına risk bütçesi %0,25, tek pozisyon %7, toplam yönetilen maruziyet %30. Günlük %1,5 zarar ve zirveden %5 düşüşte yeni alış kilitlenir. Yalnızca nakit kullanılır. Eski/manuel pozisyonlara ve önceden açılmış ADSK gibi eski strateji pozisyonlarına otomatik müdahale edilmez.",bg=bg,fg="#ffc36d",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         tk.Label(settings,text="Piyasa verisi ücretsiz IEX akışıdır; tüm ABD borsalarının işlem hacmini kapsamaz. 2.518 sembollük evrenden günlük likiditeye göre en üst 300 hisse seçilir ve her 5 dakikada tamamı yeniden taranır. Sadece aktif NYSE/NASDAQ/NYSE American adi hisseleri kullanılır; ETF ve diğer fonlar dışarıda bırakılır. Önceden açılmış pozisyonların koruma emirleri değiştirilmez. Gerçek para hesabı desteklenmez.",bg=bg,fg="#9caec1",wraplength=850,justify="left").pack(anchor="w",padx=20,pady=5)
         # Midas benzeri mum grafiği: fiyat, EMA20/50 ve hacim.
         chart_controls=tk.Frame(chart,bg=bg,padx=15,pady=12); chart_controls.pack(fill="x")
