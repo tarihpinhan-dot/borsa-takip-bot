@@ -740,13 +740,13 @@ def backtest_strategy(rows, spy_rows, starting_equity=10000.0):
     }
 
 
-def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starting_equity=10000.0, slippage=0.001):
+def backtest_intraday_strategy(intraday_rows, daily_rows, spy_daily_rows, starting_equity=10000.0, slippage=0.001, now=None):
     """Conservative single-symbol 5m simulation; stop wins when both barriers touch."""
     intraday_rows = intraday_rows or []
     if not intraday_rows or len(daily_rows or []) < 220 or len(spy_daily_rows or []) < 220:
         raise ValueError("5 dakikalık test için intraday veri ve en az 220 günlük mum gerekli.")
-    last_stamp = _parse_utc(intraday_rows[-1]["t"]) + timedelta(minutes=6)
-    rows, _, _ = prepare_intraday_rows(intraday_rows, last_stamp)
+    # Exclude the current incomplete 5-minute candle; use broker clock when supplied.
+    rows, _, _ = prepare_intraday_rows(intraday_rows, now)
     if len(rows) < 80:
         raise ValueError("Test dönemi içinde en az 80 tamamlanmış normal seans 5 dakikalık mum bulunamadı.")
 
@@ -1616,7 +1616,8 @@ class App:
                 intraday=self.broker.history(symbol,"5Min",35,adjustment="raw")
                 daily=self.broker.history(symbol,"1Day",400,adjustment="split")
                 spy_daily=self.broker.history("SPY","1Day",400,adjustment="split")
-                result=backtest_intraday_strategy(intraday,daily,spy_daily)
+                clock=self.broker.clock()
+                result=backtest_intraday_strategy(intraday,daily,spy_daily,now=clock.get("timestamp"))
                 self.events.put(("backtest",(symbol,result)))
             except Exception as exc:
                 self.events.put(("backtest_error",str(exc)))
