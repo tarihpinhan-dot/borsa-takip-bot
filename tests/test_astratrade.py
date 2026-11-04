@@ -476,7 +476,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
                 }]
             def bars(self, symbols, progress_callback=None):
                 return {"bars": {symbol: (self.daily if symbol in ("AAPL", "SPY") else []) for symbol in symbols}}
-            def intraday_bars(self, symbols, days=5):
+            def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
                 return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
             def clock(self):
                 return {"is_open": True, "timestamp": "2026-11-03T19:31:00Z"}
@@ -546,7 +546,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
                 }]
             def bars(self, symbols, progress_callback=None):
                 return {"bars": {symbol: self.daily for symbol in symbols if symbol in ("AAPL", "SPY")}}
-            def intraday_bars(self, symbols, days=5):
+            def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
                 return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
             def clock(self):
                 return {"is_open": True, "timestamp": "2026-11-03T19:31:00Z"}
@@ -633,6 +633,45 @@ class AstraTradeIntradayTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
                 broker.bars(["AAPL"])
         self.assertEqual(mocked.call_count, 1)
+
+
+
+    def test_daily_universe_cache_reuses_only_same_day_and_same_symbol_universe(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "daily.json")):
+            symbols = ["AAPL", "MSFT"]
+            daily = {
+                "AAPL": {"price": 200.0, "sma200": 180.0, "dollar_vol": 30_000_000.0},
+                "MSFT": {"price": 400.0, "sma200": 350.0, "dollar_vol": 40_000_000.0},
+            }
+            app.save_daily_universe_cache("2026-11-04", symbols, daily, ["MSFT", "AAPL"], True)
+            loaded = app.load_daily_universe_cache("2026-11-04", symbols)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded[0], daily)
+            self.assertEqual(loaded[1], ["MSFT", "AAPL"])
+            self.assertTrue(loaded[2])
+            self.assertIsNone(app.load_daily_universe_cache("2026-11-05", symbols))
+            self.assertIsNone(app.load_daily_universe_cache("2026-11-04", ["AAPL", "MSFT", "NVDA"]))
+
+    def test_intraday_bars_support_incremental_start_time_and_stop_between_batches(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        start = datetime(2026, 11, 4, 14, 30, tzinfo=timezone.utc)
+        with patch.object(broker, "call", return_value={"bars": {}}) as mocked:
+            broker.intraday_bars(
+                ["AAPL", "MSFT"],
+                start_at={"AAPL": start, "MSFT": start + timedelta(minutes=5)}
+            )
+        params = mocked.call_args.args[2]
+        self.assertEqual(params["start"], start.isoformat())
+        self.assertEqual(params["timeframe"], "5Min")
+        self.assertEqual(params["symbols"], "AAPL,MSFT")
+
+        class AlreadyStopped:
+            def is_set(self):
+                return True
+        with patch.object(broker, "call") as stopped_call:
+            broker.intraday_bars(["AAPL", "MSFT"], stop_event=AlreadyStopped())
+        stopped_call.assert_not_called()
 
 
 if __name__ == "__main__":
