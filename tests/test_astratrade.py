@@ -131,6 +131,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         broker = FakeBroker(orders)
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
              patch.object(app, "load_managed_groups", return_value={"AAPL": "astra-group"}), \
              patch.object(app, "load_managed_protection", return_value={"AAPL": {"take_profit": 120, "stop_loss": 90}}):
@@ -151,6 +152,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         stop = threading.Event()
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
              patch.object(app, "load_managed_groups", return_value={"AAPL": "astra-group"}), \
              patch.object(app, "load_managed_protection", return_value={"AAPL": {"take_profit": 120, "stop_loss": 90}}):
@@ -208,6 +210,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         broker = ScanBroker()
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value=set()), \
              patch.object(app, "load_managed_groups", return_value={}), \
              patch.object(app, "load_managed_protection", return_value={}), \
@@ -266,6 +269,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         broker = ScanBroker()
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value=set()), \
              patch.object(app, "load_managed_groups", return_value={}), \
              patch.object(app, "load_managed_protection", return_value={}), \
@@ -334,6 +338,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         broker = FakeBroker(orders)
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
              patch.object(app, "load_managed_groups", return_value={"AAPL": "astra-group"}), \
              patch.object(app, "load_managed_protection", return_value={"AAPL": {"take_profit": 120, "stop_loss": 90}}):
@@ -496,6 +501,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
         broker = IntradayBroker()
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
                  patch.object(app, "load_managed_symbols", return_value=set()), \
                  patch.object(app, "load_managed_groups", return_value={}), \
                  patch.object(app, "load_managed_protection", return_value={}), \
@@ -567,6 +573,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
                  patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
                  patch.object(app, "load_managed_groups", return_value={"AAPL": "old-group"}), \
                  patch.object(app, "load_managed_protection", return_value={
