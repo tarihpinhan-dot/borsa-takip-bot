@@ -182,6 +182,10 @@ class RetryableDataRequestError(RuntimeError):
     """A retryable market-data request exhausted its safe GET retries."""
 
 
+class DataRequestCancelled(RuntimeError):
+    """A user requested bot stop while a market-data batch was in progress."""
+
+
 class Alpaca:
     def __init__(self, key, secret):
         if not key or not secret: raise ValueError("Paper API Key ve Secret Key gerekli.")
@@ -204,7 +208,7 @@ class Alpaca:
             raise RuntimeError(f"Alpaca HTTP {exc.code} ({method} {path}): {detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"Alpaca bağlantı hatası ({path}): {exc.reason}") from exc
-    def data_call_with_retry(self, path, params=None, description="piyasa verisi", progress_callback=None, attempts=3):
+    def data_call_with_retry(self, path, params=None, description="piyasa verisi", progress_callback=None, attempts=3, stop_event=None):
         """Retry only idempotent market-data GET requests; never retry order mutations."""
         retry_markers = (
             "alpaca bağlantı hatası", "timed out", "timeout",
@@ -213,9 +217,13 @@ class Alpaca:
             "http 429", "http 500", "http 502", "http 503", "http 504"
         )
         for attempt in range(attempts):
+            if stop_event is not None and stop_event.is_set():
+                raise DataRequestCancelled(f"{description}: kullanıcı durdurma isteği gönderdi.")
             try:
                 return self.call(DATA, path, params)
             except Exception as exc:
+                if stop_event is not None and stop_event.is_set():
+                    raise DataRequestCancelled(f"{description}: kullanıcı durdurma isteği gönderdi.") from exc
                 message = str(exc).lower()
                 retryable = isinstance(exc, (TimeoutError, OSError)) or any(
                     marker in message for marker in retry_markers
@@ -236,14 +244,14 @@ class Alpaca:
                     progress_callback(notice)
                 time.sleep(delay)
 
-    def _fetch_bars_chunk(self, symbols, params, max_pages, description, progress_callback=None):
+    def _fetch_bars_chunk(self, symbols, params, max_pages, description, progress_callback=None, stop_event=None):
         """Fetch one symbol group atomically; split slow groups down to five symbols."""
         chunk_data = {}
         page_params = dict(params)
         try:
             for page_number in range(max_pages):
                 page = self.data_call_with_retry(
-                    "/v2/stocks/bars", page_params, description, progress_callback
+                    "/v2/stocks/bars", page_params, description, progress_callback, stop_event=stop_event
                 )
                 for symbol, rows in page.get("bars", {}).items():
                     chunk_data.setdefault(symbol, []).extend(rows)
@@ -256,6 +264,8 @@ class Alpaca:
                     f"{description}: sayfalama {max_pages} istekte tamamlanmadı."
                 )
             return chunk_data, set()
+        except DataRequestCancelled:
+            raise
         except RetryableDataRequestError as exc:
             if len(symbols) <= 5:
                 failed = set(symbols)
@@ -323,13 +333,15 @@ class Alpaca:
         else:
             raise RuntimeError("Alpaca emir sayfalaması beklenmeyen şekilde sonlandı; güvenlik için işlem taraması durduruldu.")
         return orders
-    def bars(self, symbols, progress_callback=None):
+    def bars(self, symbols, progress_callback=None, stop_event=None):
         """Fetch one year of daily IEX bars with safe retries and progress reporting."""
         collected = {}
         failed_symbols = set()
         total = len(symbols)
         completed = 0
         for offset in range(0, total, 20):
+            if stop_event is not None and stop_event.is_set():
+                break
             chunk = symbols[offset:offset + 20]
             params = {
                 "symbols": ",".join(chunk),
@@ -343,7 +355,8 @@ class Alpaca:
             }
             chunk_data, chunk_failed = self._fetch_bars_chunk(
                 chunk, params, max_pages=5,
-                description="Günlük hisse verisi", progress_callback=progress_callback
+                description="Günlük hisse verisi", progress_callback=progress_callback,
+                stop_event=stop_event
             )
             for symbol, rows in chunk_data.items():
                 collected.setdefault(symbol, []).extend(rows)
@@ -354,7 +367,11 @@ class Alpaca:
                     f"Günlük veri indirme: {completed}/{total} sembol tamamlandı; "
                     f"verisi alınamayan {len(failed_symbols)} sembol."
                 )
-        return {"bars": collected, "failed_symbols": sorted(failed_symbols)}
+        return {
+            "bars": collected,
+            "failed_symbols": sorted(failed_symbols),
+            "cancelled": bool(stop_event is not None and stop_event.is_set())
+        }
 
     def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
         """Fetch 5-minute IEX bars; optionally update from each symbol's last cached bar."""
@@ -386,7 +403,8 @@ class Alpaca:
                 "sort": "asc"
             }
             chunk_data, chunk_failed = self._fetch_bars_chunk(
-                chunk, params, max_pages=10, description="5 dakikalık hisse verisi"
+                chunk, params, max_pages=10, description="5 dakikalık hisse verisi",
+                stop_event=stop_event
             )
             for symbol, rows in chunk_data.items():
                 collected.setdefault(symbol, []).extend(rows)
@@ -1265,7 +1283,10 @@ class Bot:
                 samples = ", ".join(f"{sym}:{bar_counts[sym]}" for sym in batch[:8])
                 clock = self.broker.clock()
                 market_day = str(clock.get("timestamp", ""))[:10]
-                spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
+                spy_rows = self.broker.bars(["SPY"], stop_event=self.stop).get("bars", {}).get("SPY", [])
+            if self.stop.is_set():
+                self.events.put(("log", "SPY günlük verisi alınırken durdurma isteği geldi; emir gönderilmedi."))
+                return
                 spy_signal_rows, _, _ = prepare_daily_signal_rows(spy_rows, bool(clock.get("is_open")), market_day)
                 spy = analyze(spy_signal_rows)
                 market_ok = bool(spy and spy["price"] > spy["sma200"] and spy["ema50"] > spy["sma200"])
@@ -1483,8 +1504,12 @@ class Bot:
             self.events.put(("log", "Günlük veri önbelleği yok veya tarihi değişti; ilk yükleme yapılıyor."))
             daily_result = self.broker.bars(
                 symbols,
-                progress_callback=lambda message: self.events.put(("log", message))
+                progress_callback=lambda message: self.events.put(("log", message)),
+                stop_event=self.stop
             )
+            if self.stop.is_set() or daily_result.get("cancelled"):
+                self.events.put(("log", "Başlangıç veri indirmesi durdurma isteğiyle kesildi; emir gönderilmedi."))
+                return
             daily_data = daily_result.get("bars", {})
             failed_daily_symbols = daily_result.get("failed_symbols", [])
             if failed_daily_symbols:
@@ -2096,7 +2121,7 @@ class App:
         try: bot.run()
         except Exception as exc: self.events.put(("fatal",str(exc)))
     def stop_bot(self):
-        self.stop_event.set(); self.stop_button.configure(state="disabled"); self.add_log("Durdurma isteği gönderildi. Devam eden ağ isteği tamamlanınca yeni veri indirmesi yapılmayacak.")
+        self.stop_event.set(); self.stop_button.configure(state="disabled"); self.add_log("Durdurma isteği gönderildi. Devam eden tek ağ isteği tamamlanınca yeni veri indirmesi yapılmayacak.")
     def poll(self):
         try:
             while True:
