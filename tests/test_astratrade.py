@@ -185,7 +185,7 @@ class AstraTradeCoreTests(unittest.TestCase):
                 return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
             def assets(self):
                 return [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "status": "active", "tradable": True}]
-            def bars(self, symbols, progress_callback=None):
+            def bars(self, symbols, progress_callback=None, stop_event=None):
                 return {"bars": {symbol: self.rows for symbol in symbols}}
             def clock(self):
                 return {"is_open": True, "timestamp": "2026-11-03T16:00:00Z"}
@@ -244,7 +244,7 @@ class AstraTradeCoreTests(unittest.TestCase):
                 return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
             def assets(self):
                 return [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "status": "active", "tradable": True}]
-            def bars(self, symbols, progress_callback=None):
+            def bars(self, symbols, progress_callback=None, stop_event=None):
                 return {"bars": {symbol: self.rows for symbol in symbols}}
             def clock(self):
                 return {"is_open": False, "timestamp": "2026-11-03T16:00:00Z"}
@@ -479,7 +479,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
                     "symbol": "AAPL", "name": "Apple Inc. Common Stock",
                     "exchange": "NASDAQ", "status": "active", "tradable": True
                 }]
-            def bars(self, symbols, progress_callback=None):
+            def bars(self, symbols, progress_callback=None, stop_event=None):
                 return {"bars": {symbol: (self.daily if symbol in ("AAPL", "SPY") else []) for symbol in symbols}}
             def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
                 return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
@@ -550,7 +550,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
                     "symbol": "AAPL", "name": "Apple Inc. Common Stock",
                     "exchange": "NASDAQ", "status": "active", "tradable": True
                 }]
-            def bars(self, symbols, progress_callback=None):
+            def bars(self, symbols, progress_callback=None, stop_event=None):
                 return {"bars": {symbol: self.daily for symbol in symbols if symbol in ("AAPL", "SPY")}}
             def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
                 return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
