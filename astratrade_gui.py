@@ -1,4 +1,4 @@
-import base64, ctypes, hashlib, json, math, os, queue, threading, time, uuid, urllib.parse, urllib.request, tkinter as tk
+import base64, ctypes, gzip, hashlib, json, math, os, queue, threading, time, uuid, urllib.parse, urllib.request, tkinter as tk
 from urllib.error import HTTPError, URLError
 from datetime import datetime, timedelta, timezone
 from tkinter import ttk, messagebox
@@ -14,6 +14,8 @@ APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Astr
 os.makedirs(APP_DIR, exist_ok=True)
 LOG_FILE = os.path.join(APP_DIR, "astratrade.log")
 UNIVERSE_CACHE_FILE = os.path.join(APP_DIR, "daily_universe_cache.json")
+DAILY_BARS_CACHE_FILE = os.path.join(APP_DIR, "daily_bars_cache.json.gz")
+DAILY_BARS_CACHE_VERSION = 1
 UNIVERSE_CACHE_VERSION = 1
 STATE_FILE = os.path.join(APP_DIR, "bot_state.json")
 MAX_MANAGED_POSITIONS = 5
@@ -68,6 +70,66 @@ def save_daily_universe_cache(market_day, symbols, daily_signals, scan_symbols, 
         os.replace(temp_path, UNIVERSE_CACHE_FILE)
     except OSError as exc:
         logline("Günlük izleme listesi önbelleğe kaydedilemedi: " + str(exc))
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def load_daily_bars_cache(symbols, max_age_days=35):
+    """Read compressed one-year daily-bar history for quick next-day refreshes."""
+    try:
+        with gzip.open(DAILY_BARS_CACHE_FILE, "rt", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict) or payload.get("version") != DAILY_BARS_CACHE_VERSION:
+            return None
+        if payload.get("symbols_hash") != _symbol_universe_fingerprint(symbols):
+            return None
+        saved_at = _parse_utc(payload.get("saved_at"))
+        age_days = max(0.0, (datetime.now(timezone.utc) - saved_at).total_seconds() / 86400)
+        if age_days > max_age_days:
+            return None
+        bars = payload.get("bars")
+        if not isinstance(bars, dict) or any(symbol not in bars for symbol in symbols):
+            return None
+        return bars, age_days
+    except (OSError, EOFError, ValueError, TypeError, KeyError):
+        return None
+
+
+def merge_daily_bar_cache(cached_bars, updated_bars, symbols, keep_rows=260):
+    """Merge new daily bars by timestamp while retaining enough history for SMA200."""
+    merged = {}
+    fields = ("t", "o", "h", "l", "c", "v")
+    for symbol in symbols:
+        by_timestamp = {}
+        for row in (cached_bars.get(symbol, []) or []) + (updated_bars.get(symbol, []) or []):
+            stamp = str(row.get("t", ""))
+            if not stamp:
+                continue
+            by_timestamp[stamp] = {field: row.get(field) for field in fields}
+        merged[symbol] = sorted(
+            by_timestamp.values(), key=lambda row: str(row.get("t", ""))
+        )[-keep_rows:]
+    return merged
+
+
+def save_daily_bars_cache(symbols, bars):
+    """Persist compact daily OHLCV history; this file contains market data, not credentials."""
+    payload = {
+        "version": DAILY_BARS_CACHE_VERSION,
+        "symbols_hash": _symbol_universe_fingerprint(symbols),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "bars": bars
+    }
+    temp_path = DAILY_BARS_CACHE_FILE + ".tmp"
+    try:
+        with gzip.open(temp_path, "wt", encoding="utf-8", compresslevel=6) as f:
+            json.dump(payload, f, separators=(",", ":"))
+        os.replace(temp_path, DAILY_BARS_CACHE_FILE)
+    except OSError as exc:
+        logline("Günlük mum geçmişi önbelleğe kaydedilemedi: " + str(exc))
         try:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -333,23 +395,24 @@ class Alpaca:
         else:
             raise RuntimeError("Alpaca emir sayfalaması beklenmeyen şekilde sonlandı; güvenlik için işlem taraması durduruldu.")
         return orders
-    def bars(self, symbols, progress_callback=None, stop_event=None):
-        """Fetch one year of daily IEX bars with safe retries and progress reporting."""
+    def bars(self, symbols, progress_callback=None, stop_event=None, days=365):
+        """Fetch daily IEX bars; wider batches are safe for short delta-refresh windows."""
         collected = {}
         failed_symbols = set()
         total = len(symbols)
         completed = 0
-        for offset in range(0, total, 20):
+        batch_size = 100 if days <= 45 else 20
+        for offset in range(0, total, batch_size):
             if stop_event is not None and stop_event.is_set():
                 break
-            chunk = symbols[offset:offset + 20]
+            chunk = symbols[offset:offset + batch_size]
             params = {
                 "symbols": ",".join(chunk),
                 "timeframe": "1Day",
                 "limit": 10000,
                 "feed": "iex",
                 "adjustment": "split",
-                "start": (datetime.now(timezone.utc) - timedelta(days=365)).isoformat(),
+                "start": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
                 "end": datetime.now(timezone.utc).isoformat(),
                 "sort": "asc"
             }
