@@ -1,4 +1,4 @@
-import base64, ctypes, json, math, os, queue, threading, time, uuid, urllib.parse, urllib.request, tkinter as tk
+import base64, ctypes, hashlib, json, math, os, queue, threading, time, uuid, urllib.parse, urllib.request, tkinter as tk
 from urllib.error import HTTPError, URLError
 from datetime import datetime, timedelta, timezone
 from tkinter import ttk, messagebox
@@ -13,8 +13,67 @@ NEG = {"miss","downgrade","plunge","loss","warning","warns","cuts","fraud","prob
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "AstraTradeAI")
 os.makedirs(APP_DIR, exist_ok=True)
 LOG_FILE = os.path.join(APP_DIR, "astratrade.log")
+UNIVERSE_CACHE_FILE = os.path.join(APP_DIR, "daily_universe_cache.json")
+UNIVERSE_CACHE_VERSION = 1
 STATE_FILE = os.path.join(APP_DIR, "bot_state.json")
 MAX_MANAGED_POSITIONS = 5
+
+def _symbol_universe_fingerprint(symbols):
+    normalized = "\n".join(sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def load_daily_universe_cache(market_day, symbols):
+    """Load same-session daily signals; daily indicators use completed daily bars only."""
+    try:
+        with open(UNIVERSE_CACHE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != UNIVERSE_CACHE_VERSION:
+            return None
+        if payload.get("market_day") != str(market_day):
+            return None
+        if payload.get("symbols_hash") != _symbol_universe_fingerprint(symbols):
+            return None
+        daily_signals = payload.get("daily_signals")
+        scan_symbols = payload.get("scan_symbols")
+        market_ok = payload.get("market_ok")
+        if not isinstance(daily_signals, dict) or not isinstance(scan_symbols, list):
+            return None
+        if not scan_symbols or not isinstance(market_ok, bool):
+            return None
+        if any(symbol not in daily_signals for symbol in scan_symbols):
+            return None
+        return daily_signals, scan_symbols, market_ok
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_daily_universe_cache(market_day, symbols, daily_signals, scan_symbols, market_ok):
+    """Atomically persist non-sensitive daily scan metadata for same-day restarts."""
+    payload = {
+        "version": UNIVERSE_CACHE_VERSION,
+        "market_day": str(market_day),
+        "symbols_hash": _symbol_universe_fingerprint(symbols),
+        "daily_signals": daily_signals,
+        "scan_symbols": scan_symbols,
+        "market_ok": bool(market_ok),
+        "saved_at": datetime.now(timezone.utc).isoformat()
+    }
+    temp_path = UNIVERSE_CACHE_FILE + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        os.replace(temp_path, UNIVERSE_CACHE_FILE)
+    except OSError as exc:
+        logline("Günlük izleme listesi önbelleğe kaydedilemedi: " + str(exc))
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
 
 def read_app_state():
     try:
@@ -297,19 +356,32 @@ class Alpaca:
                 )
         return {"bars": collected, "failed_symbols": sorted(failed_symbols)}
 
-    def intraday_bars(self, symbols, days=5):
-        """Fetch recent 5-minute IEX bars in safe, retryable 20-symbol chunks."""
+    def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
+        """Fetch 5-minute IEX bars; optionally update from each symbol's last cached bar."""
         collected = {}
         failed_symbols = set()
         for offset in range(0, len(symbols), 20):
+            if stop_event is not None and stop_event.is_set():
+                break
             chunk = symbols[offset:offset + 20]
+            if isinstance(start_at, dict):
+                starts = [start_at.get(symbol) for symbol in chunk if start_at.get(symbol)]
+                request_start = min(starts) if starts else (
+                    datetime.now(timezone.utc) - timedelta(days=days)
+                )
+            else:
+                request_start = start_at or (
+                    datetime.now(timezone.utc) - timedelta(days=days)
+                )
+            if isinstance(request_start, str):
+                request_start = _parse_utc(request_start)
             params = {
                 "symbols": ",".join(chunk),
                 "timeframe": "5Min",
                 "limit": 10000,
                 "feed": "iex",
                 "adjustment": "raw",
-                "start": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
+                "start": request_start.astimezone(timezone.utc).isoformat(),
                 "end": datetime.now(timezone.utc).isoformat(),
                 "sort": "asc"
             }
