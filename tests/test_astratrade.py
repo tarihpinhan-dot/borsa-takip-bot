@@ -131,6 +131,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         broker = FakeBroker(orders)
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
              patch.object(app, "load_managed_groups", return_value={"AAPL": "astra-group"}), \
              patch.object(app, "load_managed_protection", return_value={"AAPL": {"take_profit": 120, "stop_loss": 90}}):
@@ -151,6 +152,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         stop = threading.Event()
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
              patch.object(app, "load_managed_groups", return_value={"AAPL": "astra-group"}), \
              patch.object(app, "load_managed_protection", return_value={"AAPL": {"take_profit": 120, "stop_loss": 90}}):
@@ -183,7 +185,7 @@ class AstraTradeCoreTests(unittest.TestCase):
                 return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
             def assets(self):
                 return [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "status": "active", "tradable": True}]
-            def bars(self, symbols, progress_callback=None):
+            def bars(self, symbols, progress_callback=None, stop_event=None, days=365):
                 return {"bars": {symbol: self.rows for symbol in symbols}}
             def clock(self):
                 return {"is_open": True, "timestamp": "2026-11-03T16:00:00Z"}
@@ -208,6 +210,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         broker = ScanBroker()
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value=set()), \
              patch.object(app, "load_managed_groups", return_value={}), \
              patch.object(app, "load_managed_protection", return_value={}), \
@@ -241,7 +244,7 @@ class AstraTradeCoreTests(unittest.TestCase):
                 return {"equity": "100000", "cash": "100000", "last_equity": "100000"}
             def assets(self):
                 return [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "exchange": "NASDAQ", "status": "active", "tradable": True}]
-            def bars(self, symbols, progress_callback=None):
+            def bars(self, symbols, progress_callback=None, stop_event=None, days=365):
                 return {"bars": {symbol: self.rows for symbol in symbols}}
             def clock(self):
                 return {"is_open": False, "timestamp": "2026-11-03T16:00:00Z"}
@@ -266,6 +269,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         broker = ScanBroker()
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value=set()), \
              patch.object(app, "load_managed_groups", return_value={}), \
              patch.object(app, "load_managed_protection", return_value={}), \
@@ -334,6 +338,7 @@ class AstraTradeCoreTests(unittest.TestCase):
         broker = FakeBroker(orders)
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
              patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
              patch.object(app, "load_managed_groups", return_value={"AAPL": "astra-group"}), \
              patch.object(app, "load_managed_protection", return_value={"AAPL": {"take_profit": 120, "stop_loss": 90}}):
@@ -474,9 +479,9 @@ class AstraTradeIntradayTests(unittest.TestCase):
                     "symbol": "AAPL", "name": "Apple Inc. Common Stock",
                     "exchange": "NASDAQ", "status": "active", "tradable": True
                 }]
-            def bars(self, symbols, progress_callback=None):
+            def bars(self, symbols, progress_callback=None, stop_event=None, days=365):
                 return {"bars": {symbol: (self.daily if symbol in ("AAPL", "SPY") else []) for symbol in symbols}}
-            def intraday_bars(self, symbols, days=5):
+            def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
                 return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
             def clock(self):
                 return {"is_open": True, "timestamp": "2026-11-03T19:31:00Z"}
@@ -496,6 +501,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
         broker = IntradayBroker()
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
                  patch.object(app, "load_managed_symbols", return_value=set()), \
                  patch.object(app, "load_managed_groups", return_value={}), \
                  patch.object(app, "load_managed_protection", return_value={}), \
@@ -544,9 +550,9 @@ class AstraTradeIntradayTests(unittest.TestCase):
                     "symbol": "AAPL", "name": "Apple Inc. Common Stock",
                     "exchange": "NASDAQ", "status": "active", "tradable": True
                 }]
-            def bars(self, symbols, progress_callback=None):
+            def bars(self, symbols, progress_callback=None, stop_event=None, days=365):
                 return {"bars": {symbol: self.daily for symbol in symbols if symbol in ("AAPL", "SPY")}}
-            def intraday_bars(self, symbols, days=5):
+            def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
                 return {"bars": {symbol: self.intraday for symbol in symbols if symbol == "AAPL"}}
             def clock(self):
                 return {"is_open": True, "timestamp": "2026-11-03T19:31:00Z"}
@@ -567,6 +573,7 @@ class AstraTradeIntradayTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(app, "STATE_FILE", os.path.join(tmp, "state.json")), \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "universe.json")), \
                  patch.object(app, "load_managed_symbols", return_value={"AAPL"}), \
                  patch.object(app, "load_managed_groups", return_value={"AAPL": "old-group"}), \
                  patch.object(app, "load_managed_protection", return_value={
@@ -633,6 +640,77 @@ class AstraTradeIntradayTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
                 broker.bars(["AAPL"])
         self.assertEqual(mocked.call_count, 1)
+
+
+
+    def test_daily_universe_cache_reuses_only_same_day_and_same_symbol_universe(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, "UNIVERSE_CACHE_FILE", os.path.join(tmp, "daily.json")):
+            symbols = ["AAPL", "MSFT"]
+            daily = {
+                "AAPL": {"price": 200.0, "sma200": 180.0, "dollar_vol": 30_000_000.0},
+                "MSFT": {"price": 400.0, "sma200": 350.0, "dollar_vol": 40_000_000.0},
+            }
+            app.save_daily_universe_cache("2026-11-04", symbols, daily, ["MSFT", "AAPL"], True)
+            loaded = app.load_daily_universe_cache("2026-11-04", symbols)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded[0], daily)
+            self.assertEqual(loaded[1], ["MSFT", "AAPL"])
+            self.assertTrue(loaded[2])
+            self.assertIsNone(app.load_daily_universe_cache("2026-11-05", symbols))
+            self.assertIsNone(app.load_daily_universe_cache("2026-11-04", ["AAPL", "MSFT", "NVDA"]))
+
+    def test_intraday_bars_support_incremental_start_time_and_stop_between_batches(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        start = datetime(2026, 11, 4, 14, 30, tzinfo=timezone.utc)
+        with patch.object(broker, "call", return_value={"bars": {}}) as mocked:
+            broker.intraday_bars(
+                ["AAPL", "MSFT"],
+                start_at={"AAPL": start, "MSFT": start + timedelta(minutes=5)}
+            )
+        params = mocked.call_args.args[2]
+        self.assertEqual(params["start"], start.isoformat())
+        self.assertEqual(params["timeframe"], "5Min")
+        self.assertEqual(params["symbols"], "AAPL,MSFT")
+
+        class AlreadyStopped:
+            def is_set(self):
+                return True
+        with patch.object(broker, "call") as stopped_call:
+            broker.intraday_bars(["AAPL", "MSFT"], stop_event=AlreadyStopped())
+        stopped_call.assert_not_called()
+
+
+
+    def test_daily_bars_cache_round_trip_and_timestamp_merge(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, "DAILY_BARS_CACHE_FILE", os.path.join(tmp, "daily.gz")):
+            symbols = ["AAPL"]
+            cached = {"AAPL": make_bars(220)}
+            app.save_daily_bars_cache(symbols, cached)
+            loaded = app.load_daily_bars_cache(symbols)
+            self.assertIsNotNone(loaded)
+            old_bars, age_days = loaded
+            self.assertLess(age_days, 1.0)
+            overlapping = [dict(cached["AAPL"][-1])]
+            newer = dict(cached["AAPL"][-1])
+            newer["t"] = "2026-11-04T00:00:00Z"
+            newer["c"] = 999.0
+            merged = app.merge_daily_bar_cache(old_bars, {"AAPL": overlapping + [newer]}, symbols)
+            self.assertEqual(len(merged["AAPL"]), 221)
+            self.assertEqual(merged["AAPL"][-1]["c"], 999.0)
+            self.assertEqual(merged["AAPL"][-1]["t"], "2026-11-04T00:00:00Z")
+
+    def test_short_daily_refresh_uses_wider_safe_symbol_batches(self):
+        broker = app.Alpaca("paper-key", "paper-secret")
+        symbols = [f"SYM{i:03d}" for i in range(100)]
+        with patch.object(broker, "call", return_value={"bars": {}}) as mocked:
+            result = broker.bars(symbols, days=10)
+        self.assertEqual(mocked.call_count, 1)
+        params = mocked.call_args.args[2]
+        self.assertEqual(len(params["symbols"].split(",")), 100)
+        self.assertEqual(params["timeframe"], "1Day")
+        self.assertEqual(result["failed_symbols"], [])
 
 
 if __name__ == "__main__":

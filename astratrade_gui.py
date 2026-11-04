@@ -1,4 +1,4 @@
-import base64, ctypes, json, math, os, queue, threading, time, uuid, urllib.parse, urllib.request, tkinter as tk
+import base64, ctypes, gzip, hashlib, json, math, os, queue, threading, time, uuid, urllib.parse, urllib.request, tkinter as tk
 from urllib.error import HTTPError, URLError
 from datetime import datetime, timedelta, timezone
 from tkinter import ttk, messagebox
@@ -13,8 +13,129 @@ NEG = {"miss","downgrade","plunge","loss","warning","warns","cuts","fraud","prob
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "AstraTradeAI")
 os.makedirs(APP_DIR, exist_ok=True)
 LOG_FILE = os.path.join(APP_DIR, "astratrade.log")
+UNIVERSE_CACHE_FILE = os.path.join(APP_DIR, "daily_universe_cache.json")
+DAILY_BARS_CACHE_FILE = os.path.join(APP_DIR, "daily_bars_cache.json.gz")
+DAILY_BARS_CACHE_VERSION = 1
+UNIVERSE_CACHE_VERSION = 1
 STATE_FILE = os.path.join(APP_DIR, "bot_state.json")
 MAX_MANAGED_POSITIONS = 5
+
+def _symbol_universe_fingerprint(symbols):
+    normalized = "\n".join(sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def load_daily_universe_cache(market_day, symbols):
+    """Load same-session daily signals; daily indicators use completed daily bars only."""
+    try:
+        with open(UNIVERSE_CACHE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != UNIVERSE_CACHE_VERSION:
+            return None
+        if payload.get("market_day") != str(market_day):
+            return None
+        if payload.get("symbols_hash") != _symbol_universe_fingerprint(symbols):
+            return None
+        daily_signals = payload.get("daily_signals")
+        scan_symbols = payload.get("scan_symbols")
+        market_ok = payload.get("market_ok")
+        if not isinstance(daily_signals, dict) or not isinstance(scan_symbols, list):
+            return None
+        if not scan_symbols or not isinstance(market_ok, bool):
+            return None
+        if any(symbol not in daily_signals for symbol in scan_symbols):
+            return None
+        return daily_signals, scan_symbols, market_ok
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_daily_universe_cache(market_day, symbols, daily_signals, scan_symbols, market_ok):
+    """Atomically persist non-sensitive daily scan metadata for same-day restarts."""
+    payload = {
+        "version": UNIVERSE_CACHE_VERSION,
+        "market_day": str(market_day),
+        "symbols_hash": _symbol_universe_fingerprint(symbols),
+        "daily_signals": daily_signals,
+        "scan_symbols": scan_symbols,
+        "market_ok": bool(market_ok),
+        "saved_at": datetime.now(timezone.utc).isoformat()
+    }
+    temp_path = UNIVERSE_CACHE_FILE + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        os.replace(temp_path, UNIVERSE_CACHE_FILE)
+    except OSError as exc:
+        logline("Günlük izleme listesi önbelleğe kaydedilemedi: " + str(exc))
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def load_daily_bars_cache(symbols, max_age_days=35):
+    """Read compressed one-year daily-bar history for quick next-day refreshes."""
+    try:
+        with gzip.open(DAILY_BARS_CACHE_FILE, "rt", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict) or payload.get("version") != DAILY_BARS_CACHE_VERSION:
+            return None
+        if payload.get("symbols_hash") != _symbol_universe_fingerprint(symbols):
+            return None
+        saved_at = _parse_utc(payload.get("saved_at"))
+        age_days = max(0.0, (datetime.now(timezone.utc) - saved_at).total_seconds() / 86400)
+        if age_days > max_age_days:
+            return None
+        bars = payload.get("bars")
+        if not isinstance(bars, dict) or any(symbol not in bars for symbol in symbols):
+            return None
+        return bars, age_days
+    except (OSError, EOFError, ValueError, TypeError, KeyError):
+        return None
+
+
+def merge_daily_bar_cache(cached_bars, updated_bars, symbols, keep_rows=260):
+    """Merge new daily bars by timestamp while retaining enough history for SMA200."""
+    merged = {}
+    fields = ("t", "o", "h", "l", "c", "v")
+    for symbol in symbols:
+        by_timestamp = {}
+        for row in (cached_bars.get(symbol, []) or []) + (updated_bars.get(symbol, []) or []):
+            stamp = str(row.get("t", ""))
+            if not stamp:
+                continue
+            by_timestamp[stamp] = {field: row.get(field) for field in fields}
+        merged[symbol] = sorted(
+            by_timestamp.values(), key=lambda row: str(row.get("t", ""))
+        )[-keep_rows:]
+    return merged
+
+
+def save_daily_bars_cache(symbols, bars):
+    """Persist compact daily OHLCV history; this file contains market data, not credentials."""
+    payload = {
+        "version": DAILY_BARS_CACHE_VERSION,
+        "symbols_hash": _symbol_universe_fingerprint(symbols),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "bars": bars
+    }
+    temp_path = DAILY_BARS_CACHE_FILE + ".tmp"
+    try:
+        with gzip.open(temp_path, "wt", encoding="utf-8", compresslevel=6) as f:
+            json.dump(payload, f, separators=(",", ":"))
+        os.replace(temp_path, DAILY_BARS_CACHE_FILE)
+    except OSError as exc:
+        logline("Günlük mum geçmişi önbelleğe kaydedilemedi: " + str(exc))
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
 
 def read_app_state():
     try:
@@ -123,6 +244,10 @@ class RetryableDataRequestError(RuntimeError):
     """A retryable market-data request exhausted its safe GET retries."""
 
 
+class DataRequestCancelled(RuntimeError):
+    """A user requested bot stop while a market-data batch was in progress."""
+
+
 class Alpaca:
     def __init__(self, key, secret):
         if not key or not secret: raise ValueError("Paper API Key ve Secret Key gerekli.")
@@ -145,7 +270,7 @@ class Alpaca:
             raise RuntimeError(f"Alpaca HTTP {exc.code} ({method} {path}): {detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"Alpaca bağlantı hatası ({path}): {exc.reason}") from exc
-    def data_call_with_retry(self, path, params=None, description="piyasa verisi", progress_callback=None, attempts=3):
+    def data_call_with_retry(self, path, params=None, description="piyasa verisi", progress_callback=None, attempts=3, stop_event=None):
         """Retry only idempotent market-data GET requests; never retry order mutations."""
         retry_markers = (
             "alpaca bağlantı hatası", "timed out", "timeout",
@@ -154,9 +279,13 @@ class Alpaca:
             "http 429", "http 500", "http 502", "http 503", "http 504"
         )
         for attempt in range(attempts):
+            if stop_event is not None and stop_event.is_set():
+                raise DataRequestCancelled(f"{description}: kullanıcı durdurma isteği gönderdi.")
             try:
                 return self.call(DATA, path, params)
             except Exception as exc:
+                if stop_event is not None and stop_event.is_set():
+                    raise DataRequestCancelled(f"{description}: kullanıcı durdurma isteği gönderdi.") from exc
                 message = str(exc).lower()
                 retryable = isinstance(exc, (TimeoutError, OSError)) or any(
                     marker in message for marker in retry_markers
@@ -177,14 +306,14 @@ class Alpaca:
                     progress_callback(notice)
                 time.sleep(delay)
 
-    def _fetch_bars_chunk(self, symbols, params, max_pages, description, progress_callback=None):
+    def _fetch_bars_chunk(self, symbols, params, max_pages, description, progress_callback=None, stop_event=None):
         """Fetch one symbol group atomically; split slow groups down to five symbols."""
         chunk_data = {}
         page_params = dict(params)
         try:
             for page_number in range(max_pages):
                 page = self.data_call_with_retry(
-                    "/v2/stocks/bars", page_params, description, progress_callback
+                    "/v2/stocks/bars", page_params, description, progress_callback, stop_event=stop_event
                 )
                 for symbol, rows in page.get("bars", {}).items():
                     chunk_data.setdefault(symbol, []).extend(rows)
@@ -197,6 +326,8 @@ class Alpaca:
                     f"{description}: sayfalama {max_pages} istekte tamamlanmadı."
                 )
             return chunk_data, set()
+        except DataRequestCancelled:
+            raise
         except RetryableDataRequestError as exc:
             if len(symbols) <= 5:
                 failed = set(symbols)
@@ -221,10 +352,10 @@ class Alpaca:
             left_params = dict(params, symbols=",".join(left_symbols))
             right_params = dict(params, symbols=",".join(right_symbols))
             left_data, left_failed = self._fetch_bars_chunk(
-                left_symbols, left_params, max_pages, description, progress_callback
+                left_symbols, left_params, max_pages, description, progress_callback, stop_event
             )
             right_data, right_failed = self._fetch_bars_chunk(
-                right_symbols, right_params, max_pages, description, progress_callback
+                right_symbols, right_params, max_pages, description, progress_callback, stop_event
             )
             for symbol, rows in right_data.items():
                 left_data.setdefault(symbol, []).extend(rows)
@@ -264,28 +395,35 @@ class Alpaca:
         else:
             raise RuntimeError("Alpaca emir sayfalaması beklenmeyen şekilde sonlandı; güvenlik için işlem taraması durduruldu.")
         return orders
-    def bars(self, symbols, progress_callback=None):
-        """Fetch one year of daily IEX bars with safe retries and progress reporting."""
+    def bars(self, symbols, progress_callback=None, stop_event=None, days=365):
+        """Fetch daily IEX bars; wider batches are safe for short delta-refresh windows."""
         collected = {}
         failed_symbols = set()
         total = len(symbols)
         completed = 0
-        for offset in range(0, total, 20):
-            chunk = symbols[offset:offset + 20]
+        batch_size = 100 if days <= 45 else 20
+        for offset in range(0, total, batch_size):
+            if stop_event is not None and stop_event.is_set():
+                break
+            chunk = symbols[offset:offset + batch_size]
             params = {
                 "symbols": ",".join(chunk),
                 "timeframe": "1Day",
                 "limit": 10000,
                 "feed": "iex",
                 "adjustment": "split",
-                "start": (datetime.now(timezone.utc) - timedelta(days=365)).isoformat(),
+                "start": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
                 "end": datetime.now(timezone.utc).isoformat(),
                 "sort": "asc"
             }
-            chunk_data, chunk_failed = self._fetch_bars_chunk(
-                chunk, params, max_pages=5,
-                description="Günlük hisse verisi", progress_callback=progress_callback
-            )
+            try:
+                chunk_data, chunk_failed = self._fetch_bars_chunk(
+                    chunk, params, max_pages=5,
+                    description="Günlük hisse verisi", progress_callback=progress_callback,
+                    stop_event=stop_event
+                )
+            except DataRequestCancelled:
+                break
             for symbol, rows in chunk_data.items():
                 collected.setdefault(symbol, []).extend(rows)
             failed_symbols.update(chunk_failed)
@@ -295,26 +433,44 @@ class Alpaca:
                     f"Günlük veri indirme: {completed}/{total} sembol tamamlandı; "
                     f"verisi alınamayan {len(failed_symbols)} sembol."
                 )
-        return {"bars": collected, "failed_symbols": sorted(failed_symbols)}
+        return {
+            "bars": collected,
+            "failed_symbols": sorted(failed_symbols),
+            "cancelled": bool(stop_event is not None and stop_event.is_set())
+        }
 
-    def intraday_bars(self, symbols, days=5):
-        """Fetch recent 5-minute IEX bars in safe, retryable 20-symbol chunks."""
+    def intraday_bars(self, symbols, days=5, start_at=None, stop_event=None):
+        """Fetch 5-minute IEX bars; optionally update from each symbol's last cached bar."""
         collected = {}
         failed_symbols = set()
         for offset in range(0, len(symbols), 20):
+            if stop_event is not None and stop_event.is_set():
+                break
             chunk = symbols[offset:offset + 20]
+            if isinstance(start_at, dict):
+                starts = [start_at.get(symbol) for symbol in chunk if start_at.get(symbol)]
+                request_start = min(starts) if starts else (
+                    datetime.now(timezone.utc) - timedelta(days=days)
+                )
+            else:
+                request_start = start_at or (
+                    datetime.now(timezone.utc) - timedelta(days=days)
+                )
+            if isinstance(request_start, str):
+                request_start = _parse_utc(request_start)
             params = {
                 "symbols": ",".join(chunk),
                 "timeframe": "5Min",
                 "limit": 10000,
                 "feed": "iex",
                 "adjustment": "raw",
-                "start": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
+                "start": request_start.astimezone(timezone.utc).isoformat(),
                 "end": datetime.now(timezone.utc).isoformat(),
                 "sort": "asc"
             }
             chunk_data, chunk_failed = self._fetch_bars_chunk(
-                chunk, params, max_pages=10, description="5 dakikalık hisse verisi"
+                chunk, params, max_pages=10, description="5 dakikalık hisse verisi",
+                stop_event=stop_event
             )
             for symbol, rows in chunk_data.items():
                 collected.setdefault(symbol, []).extend(rows)
@@ -1398,49 +1554,89 @@ class Bot:
 
         startup_clock = self.broker.clock()
         market_day = str(startup_clock.get("timestamp", ""))[:10]
-        self.events.put(("log", f"ABD adi hisse evreni: {len(symbols)} sembol; likidite sıralaması hazırlanıyor."))
-        daily_result = self.broker.bars(
-            symbols,
-            progress_callback=lambda message: self.events.put(("log", message))
-        )
-        daily_data = daily_result.get("bars", {})
-        failed_daily_symbols = daily_result.get("failed_symbols", [])
-        if failed_daily_symbols:
-            self.events.put(("log", f"Günlük verisi alınamayan {len(failed_daily_symbols)} sembol yeni alım adaylarından çıkarıldı."))
-        if len(failed_daily_symbols) > max(25, int(len(symbols) * 0.02)):
-            raise RuntimeError(
-                f"Günlük veri kaybı yüksek ({len(failed_daily_symbols)}/{len(symbols)} sembol); "
-                "eksik evrenle işlem yapılmaması için bot durduruldu."
+        self.events.put(("log", f"ABD adi hisse evreni: {len(symbols)} sembol; günlük izleme listesi hazırlanıyor."))
+        cached_universe = load_daily_universe_cache(market_day, symbols)
+        if cached_universe:
+            daily_signals, scan_symbols, market_ok = cached_universe
+            self.events.put((
+                "log",
+                f"Aynı günün günlük izleme listesi önbellekten yüklendi: "
+                f"{len(scan_symbols)} hisse; 2.518 sembolün günlük verisi yeniden indirilmeyecek."
+            ))
+        else:
+            cached_daily_bars = load_daily_bars_cache(symbols)
+            if cached_daily_bars:
+                cached_bars, cache_age_days = cached_daily_bars
+                refresh_days = min(45, max(10, int(math.ceil(cache_age_days)) + 7))
+                self.events.put((
+                    "log",
+                    f"Sıkıştırılmış günlük geçmiş bulundu; yalnızca son {refresh_days} günün "
+                    "günlük verisi güncelleniyor."
+                ))
+            else:
+                cached_bars = None
+                refresh_days = 365
+                self.events.put((
+                    "log",
+                    "Günlük geçmiş önbelleği yok, eski veya sembol evreni değişmiş; "
+                    "ilk tam geçmiş indiriliyor."
+                ))
+            daily_result = self.broker.bars(
+                symbols,
+                progress_callback=lambda message: self.events.put(("log", message)),
+                stop_event=self.stop,
+                days=refresh_days
             )
-        daily_signals = {}
-        for symbol in symbols:
-            completed, _, _ = prepare_daily_signal_rows(
-                daily_data.get(symbol, []), bool(startup_clock.get("is_open")), market_day
+            if self.stop.is_set() or daily_result.get("cancelled"):
+                self.events.put(("log", "Başlangıç veri indirmesi durdurma isteğiyle kesildi; emir gönderilmedi."))
+                return
+            updated_daily_data = daily_result.get("bars", {})
+            if cached_bars is not None:
+                daily_data = merge_daily_bar_cache(cached_bars, updated_daily_data, symbols)
+            else:
+                daily_data = merge_daily_bar_cache({}, updated_daily_data, symbols)
+            save_daily_bars_cache(symbols, daily_data)
+            failed_daily_symbols = daily_result.get("failed_symbols", [])
+            if failed_daily_symbols:
+                self.events.put(("log", f"Günlük verisi alınamayan {len(failed_daily_symbols)} sembol yeni alım adaylarından çıkarıldı."))
+            if len(failed_daily_symbols) > max(25, int(len(symbols) * 0.02)):
+                raise RuntimeError(
+                    f"Günlük veri kaybı yüksek ({len(failed_daily_symbols)}/{len(symbols)} sembol); "
+                    "eksik evrenle işlem yapılmaması için bot durduruldu."
+                )
+            daily_signals = {}
+            for symbol in symbols:
+                completed, _, _ = prepare_daily_signal_rows(
+                    daily_data.get(symbol, []), bool(startup_clock.get("is_open")), market_day
+                )
+                signal = analyze(completed)
+                if signal and signal["price"] >= 10 and signal["dollar_vol"] >= 20_000_000:
+                    daily_signals[symbol] = signal
+            ranked = sorted(
+                daily_signals,
+                key=lambda symbol: daily_signals[symbol]["dollar_vol"],
+                reverse=True
             )
-            signal = analyze(completed)
-            if signal and signal["price"] >= 10 and signal["dollar_vol"] >= 20_000_000:
-                daily_signals[symbol] = signal
-        ranked = sorted(
-            daily_signals,
-            key=lambda symbol: daily_signals[symbol]["dollar_vol"],
-            reverse=True
-        )
-        scan_symbols = ranked[:300]
-        if not scan_symbols:
-            raise RuntimeError("20 milyon USD üzeri ortalama günlük dolar hacmine sahip yeterli aday bulunamadı.")
-        del daily_data
+            scan_symbols = ranked[:300]
+            if not scan_symbols:
+                raise RuntimeError("20 milyon USD üzeri ortalama günlük dolar hacmine sahip yeterli aday bulunamadı.")
+            del daily_data
+            spy_rows = self.broker.bars(["SPY"], stop_event=self.stop).get("bars", {}).get("SPY", [])
+            if self.stop.is_set():
+                self.events.put(("log", "SPY günlük verisi alınırken durdurma isteği geldi; emir gönderilmedi."))
+                return
+            spy_completed, _, _ = prepare_daily_signal_rows(
+                spy_rows, bool(startup_clock.get("is_open")), market_day
+            )
+            spy_signal = analyze(spy_completed)
+            market_ok = bool(
+                spy_signal
+                and spy_signal["price"] > spy_signal["sma200"]
+                and spy_signal["ema50"] > spy_signal["sma200"]
+            )
+            save_daily_universe_cache(market_day, symbols, daily_signals, scan_symbols, market_ok)
         self.daily_signals = daily_signals
         self.scan_symbols = scan_symbols
-        spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
-        spy_completed, _, _ = prepare_daily_signal_rows(
-            spy_rows, bool(startup_clock.get("is_open")), market_day
-        )
-        spy_signal = analyze(spy_completed)
-        market_ok = bool(
-            spy_signal
-            and spy_signal["price"] > spy_signal["sma200"]
-            and spy_signal["ema50"] > spy_signal["sma200"]
-        )
         self.events.put(("log", f"Kısa vadeli izleme listesi: {len(scan_symbols)} en likit hisse | günlük ortalama dolar hacmi en az USD 20 milyon."))
         self.events.put(("log", "Strateji: 5 dakikalık EMA9/21 + VWAP + MACD + Wilder RSI + 6 mumluk kırılım + hacim; 15 dakikalık EMA9/21 teyidi; günlük SMA200 rejim filtresi."))
         self.events.put(("log", f"İşlem planı: pozisyon başına USD {self.profit_target_usd:.2f} gerçekleşmemiş kâr hedefi; hedef/stop en az 1,6; stop %0,50-%1,00; 45 dk azami taşıma; 15:45 ET gün sonu kapatma."))
@@ -1527,7 +1723,61 @@ class Bot:
                     symbol for symbol in held
                     if self.managed_protection.get(symbol, {}).get("strategy") == "intraday_v1"
                 })
-                intraday_data = self.broker.intraday_bars(intraday_symbols, days=5).get("bars", {})
+                if not hasattr(self, "_intraday_cache"):
+                    self._intraday_cache = {}
+                new_intraday_symbols = [
+                    symbol for symbol in intraday_symbols
+                    if symbol not in self._intraday_cache
+                ]
+                if new_intraday_symbols and not self.stop.is_set():
+                    initial_data = self.broker.intraday_bars(
+                        new_intraday_symbols, days=5, stop_event=self.stop
+                    ).get("bars", {})
+                    self._intraday_cache.update({
+                        symbol: list(rows) for symbol, rows in initial_data.items()
+                    })
+                    for symbol in new_intraday_symbols:
+                        self._intraday_cache.setdefault(symbol, [])
+                incremental_symbols = [
+                    symbol for symbol in intraday_symbols
+                    if symbol not in new_intraday_symbols
+                ]
+                if incremental_symbols and not self.stop.is_set():
+                    incremental_starts = {}
+                    fallback_start = datetime.now(timezone.utc) - timedelta(days=5)
+                    for symbol in incremental_symbols:
+                        cached_rows = self._intraday_cache.get(symbol, [])
+                        if cached_rows:
+                            last_stamp = max(_parse_utc(row["t"]) for row in cached_rows)
+                            incremental_starts[symbol] = last_stamp - timedelta(minutes=5)
+                        else:
+                            incremental_starts[symbol] = fallback_start
+                    delta_data = self.broker.intraday_bars(
+                        incremental_symbols, start_at=incremental_starts, stop_event=self.stop
+                    ).get("bars", {})
+                    for symbol, new_rows in delta_data.items():
+                        by_timestamp = {
+                            str(row.get("t")): row
+                            for row in self._intraday_cache.get(symbol, [])
+                        }
+                        for row in new_rows:
+                            by_timestamp[str(row.get("t"))] = row
+                        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+                        self._intraday_cache[symbol] = sorted(
+                            (
+                                row for row in by_timestamp.values()
+                                if _parse_utc(row.get("t")) >= cutoff
+                            ),
+                            key=lambda row: _parse_utc(row.get("t"))
+                        )
+                for symbol in intraday_symbols:
+                    self._intraday_cache.setdefault(symbol, [])
+                self._intraday_cache = {
+                    symbol: self._intraday_cache[symbol] for symbol in intraday_symbols
+                }
+                if self.stop.is_set():
+                    break
+                intraday_data = self._intraday_cache
                 equity_account = self.broker.account()
                 equity = float(equity_account.get("equity", 0) or 0)
                 cash = float(equity_account.get("cash", 0) or 0)
@@ -1959,7 +2209,7 @@ class App:
         try: bot.run()
         except Exception as exc: self.events.put(("fatal",str(exc)))
     def stop_bot(self):
-        self.stop_event.set(); self.stop_button.configure(state="disabled"); self.add_log("Durdurma isteği gönderildi.")
+        self.stop_event.set(); self.stop_button.configure(state="disabled"); self.add_log("Durdurma isteği gönderildi. Devam eden tek ağ isteği tamamlanınca yeni veri indirmesi yapılmayacak.")
     def poll(self):
         try:
             while True:
