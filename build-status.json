@@ -1,9 +1,9 @@
 {
   "status": "success",
-  "workflow_run_id": "41860304373",
+  "workflow_run_id": "41860533151",
   "run_attempt": "1",
-  "source_commit": "04cfdf0de9fdc41978a04564eb9d766bf40fea7f",
-  "branch": "perf/startup-and-scan-cache",
+  "source_commit": "ad58100d35235528e50b6aa63892eb92901f0d74",
+  "branch": "main",
   "artifact_name": "AstraTradeAI-Windows",
-  "recorded_at_utc": "2026-11-04T15:41:57.8730768Z"
+  "recorded_at_utc": "2026-11-04T15:43:44.1110986Z"
 }
