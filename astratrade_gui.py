@@ -1470,49 +1470,60 @@ class Bot:
 
         startup_clock = self.broker.clock()
         market_day = str(startup_clock.get("timestamp", ""))[:10]
-        self.events.put(("log", f"ABD adi hisse evreni: {len(symbols)} sembol; likidite sıralaması hazırlanıyor."))
-        daily_result = self.broker.bars(
-            symbols,
-            progress_callback=lambda message: self.events.put(("log", message))
-        )
-        daily_data = daily_result.get("bars", {})
-        failed_daily_symbols = daily_result.get("failed_symbols", [])
-        if failed_daily_symbols:
-            self.events.put(("log", f"Günlük verisi alınamayan {len(failed_daily_symbols)} sembol yeni alım adaylarından çıkarıldı."))
-        if len(failed_daily_symbols) > max(25, int(len(symbols) * 0.02)):
-            raise RuntimeError(
-                f"Günlük veri kaybı yüksek ({len(failed_daily_symbols)}/{len(symbols)} sembol); "
-                "eksik evrenle işlem yapılmaması için bot durduruldu."
+        self.events.put(("log", f"ABD adi hisse evreni: {len(symbols)} sembol; günlük izleme listesi hazırlanıyor."))
+        cached_universe = load_daily_universe_cache(market_day, symbols)
+        if cached_universe:
+            daily_signals, scan_symbols, market_ok = cached_universe
+            self.events.put((
+                "log",
+                f"Aynı günün günlük izleme listesi önbellekten yüklendi: "
+                f"{len(scan_symbols)} hisse; 2.518 sembolün günlük verisi yeniden indirilmeyecek."
+            ))
+        else:
+            self.events.put(("log", "Günlük veri önbelleği yok veya tarihi değişti; ilk yükleme yapılıyor."))
+            daily_result = self.broker.bars(
+                symbols,
+                progress_callback=lambda message: self.events.put(("log", message))
             )
-        daily_signals = {}
-        for symbol in symbols:
-            completed, _, _ = prepare_daily_signal_rows(
-                daily_data.get(symbol, []), bool(startup_clock.get("is_open")), market_day
+            daily_data = daily_result.get("bars", {})
+            failed_daily_symbols = daily_result.get("failed_symbols", [])
+            if failed_daily_symbols:
+                self.events.put(("log", f"Günlük verisi alınamayan {len(failed_daily_symbols)} sembol yeni alım adaylarından çıkarıldı."))
+            if len(failed_daily_symbols) > max(25, int(len(symbols) * 0.02)):
+                raise RuntimeError(
+                    f"Günlük veri kaybı yüksek ({len(failed_daily_symbols)}/{len(symbols)} sembol); "
+                    "eksik evrenle işlem yapılmaması için bot durduruldu."
+                )
+            daily_signals = {}
+            for symbol in symbols:
+                completed, _, _ = prepare_daily_signal_rows(
+                    daily_data.get(symbol, []), bool(startup_clock.get("is_open")), market_day
+                )
+                signal = analyze(completed)
+                if signal and signal["price"] >= 10 and signal["dollar_vol"] >= 20_000_000:
+                    daily_signals[symbol] = signal
+            ranked = sorted(
+                daily_signals,
+                key=lambda symbol: daily_signals[symbol]["dollar_vol"],
+                reverse=True
             )
-            signal = analyze(completed)
-            if signal and signal["price"] >= 10 and signal["dollar_vol"] >= 20_000_000:
-                daily_signals[symbol] = signal
-        ranked = sorted(
-            daily_signals,
-            key=lambda symbol: daily_signals[symbol]["dollar_vol"],
-            reverse=True
-        )
-        scan_symbols = ranked[:300]
-        if not scan_symbols:
-            raise RuntimeError("20 milyon USD üzeri ortalama günlük dolar hacmine sahip yeterli aday bulunamadı.")
-        del daily_data
+            scan_symbols = ranked[:300]
+            if not scan_symbols:
+                raise RuntimeError("20 milyon USD üzeri ortalama günlük dolar hacmine sahip yeterli aday bulunamadı.")
+            del daily_data
+            spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
+            spy_completed, _, _ = prepare_daily_signal_rows(
+                spy_rows, bool(startup_clock.get("is_open")), market_day
+            )
+            spy_signal = analyze(spy_completed)
+            market_ok = bool(
+                spy_signal
+                and spy_signal["price"] > spy_signal["sma200"]
+                and spy_signal["ema50"] > spy_signal["sma200"]
+            )
+            save_daily_universe_cache(market_day, symbols, daily_signals, scan_symbols, market_ok)
         self.daily_signals = daily_signals
         self.scan_symbols = scan_symbols
-        spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
-        spy_completed, _, _ = prepare_daily_signal_rows(
-            spy_rows, bool(startup_clock.get("is_open")), market_day
-        )
-        spy_signal = analyze(spy_completed)
-        market_ok = bool(
-            spy_signal
-            and spy_signal["price"] > spy_signal["sma200"]
-            and spy_signal["ema50"] > spy_signal["sma200"]
-        )
         self.events.put(("log", f"Kısa vadeli izleme listesi: {len(scan_symbols)} en likit hisse | günlük ortalama dolar hacmi en az USD 20 milyon."))
         self.events.put(("log", "Strateji: 5 dakikalık EMA9/21 + VWAP + MACD + Wilder RSI + 6 mumluk kırılım + hacim; 15 dakikalık EMA9/21 teyidi; günlük SMA200 rejim filtresi."))
         self.events.put(("log", f"İşlem planı: pozisyon başına USD {self.profit_target_usd:.2f} gerçekleşmemiş kâr hedefi; hedef/stop en az 1,6; stop %0,50-%1,00; 45 dk azami taşıma; 15:45 ET gün sonu kapatma."))
@@ -1599,7 +1610,61 @@ class Bot:
                     symbol for symbol in held
                     if self.managed_protection.get(symbol, {}).get("strategy") == "intraday_v1"
                 })
-                intraday_data = self.broker.intraday_bars(intraday_symbols, days=5).get("bars", {})
+                if not hasattr(self, "_intraday_cache"):
+                    self._intraday_cache = {}
+                new_intraday_symbols = [
+                    symbol for symbol in intraday_symbols
+                    if symbol not in self._intraday_cache
+                ]
+                if new_intraday_symbols and not self.stop.is_set():
+                    initial_data = self.broker.intraday_bars(
+                        new_intraday_symbols, days=5, stop_event=self.stop
+                    ).get("bars", {})
+                    self._intraday_cache.update({
+                        symbol: list(rows) for symbol, rows in initial_data.items()
+                    })
+                    for symbol in new_intraday_symbols:
+                        self._intraday_cache.setdefault(symbol, [])
+                incremental_symbols = [
+                    symbol for symbol in intraday_symbols
+                    if symbol not in new_intraday_symbols
+                ]
+                if incremental_symbols and not self.stop.is_set():
+                    incremental_starts = {}
+                    fallback_start = datetime.now(timezone.utc) - timedelta(days=5)
+                    for symbol in incremental_symbols:
+                        cached_rows = self._intraday_cache.get(symbol, [])
+                        if cached_rows:
+                            last_stamp = max(_parse_utc(row["t"]) for row in cached_rows)
+                            incremental_starts[symbol] = last_stamp - timedelta(minutes=5)
+                        else:
+                            incremental_starts[symbol] = fallback_start
+                    delta_data = self.broker.intraday_bars(
+                        incremental_symbols, start_at=incremental_starts, stop_event=self.stop
+                    ).get("bars", {})
+                    for symbol, new_rows in delta_data.items():
+                        by_timestamp = {
+                            str(row.get("t")): row
+                            for row in self._intraday_cache.get(symbol, [])
+                        }
+                        for row in new_rows:
+                            by_timestamp[str(row.get("t"))] = row
+                        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+                        self._intraday_cache[symbol] = sorted(
+                            (
+                                row for row in by_timestamp.values()
+                                if _parse_utc(row.get("t")) >= cutoff
+                            ),
+                            key=lambda row: _parse_utc(row.get("t"))
+                        )
+                for symbol in intraday_symbols:
+                    self._intraday_cache.setdefault(symbol, [])
+                self._intraday_cache = {
+                    symbol: self._intraday_cache[symbol] for symbol in intraday_symbols
+                }
+                if self.stop.is_set():
+                    break
+                intraday_data = self._intraday_cache
                 equity_account = self.broker.account()
                 equity = float(equity_account.get("equity", 0) or 0)
                 cash = float(equity_account.get("cash", 0) or 0)
@@ -2031,7 +2096,7 @@ class App:
         try: bot.run()
         except Exception as exc: self.events.put(("fatal",str(exc)))
     def stop_bot(self):
-        self.stop_event.set(); self.stop_button.configure(state="disabled"); self.add_log("Durdurma isteği gönderildi.")
+        self.stop_event.set(); self.stop_button.configure(state="disabled"); self.add_log("Durdurma isteği gönderildi. Devam eden ağ isteği tamamlanınca yeni veri indirmesi yapılmayacak.")
     def poll(self):
         try:
             while True:
