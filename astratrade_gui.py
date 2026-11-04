@@ -1286,10 +1286,7 @@ class Bot:
                 samples = ", ".join(f"{sym}:{bar_counts[sym]}" for sym in batch[:8])
                 clock = self.broker.clock()
                 market_day = str(clock.get("timestamp", ""))[:10]
-                spy_rows = self.broker.bars(["SPY"], stop_event=self.stop).get("bars", {}).get("SPY", [])
-            if self.stop.is_set():
-                self.events.put(("log", "SPY günlük verisi alınırken durdurma isteği geldi; emir gönderilmedi."))
-                return
+                spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
                 spy_signal_rows, _, _ = prepare_daily_signal_rows(spy_rows, bool(clock.get("is_open")), market_day)
                 spy = analyze(spy_signal_rows)
                 market_ok = bool(spy and spy["price"] > spy["sma200"] and spy["ema50"] > spy["sma200"])
