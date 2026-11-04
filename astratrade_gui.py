@@ -1564,16 +1564,38 @@ class Bot:
                 f"{len(scan_symbols)} hisse; 2.518 sembolün günlük verisi yeniden indirilmeyecek."
             ))
         else:
-            self.events.put(("log", "Günlük veri önbelleği yok veya tarihi değişti; ilk yükleme yapılıyor."))
+            cached_daily_bars = load_daily_bars_cache(symbols)
+            if cached_daily_bars:
+                cached_bars, cache_age_days = cached_daily_bars
+                refresh_days = min(45, max(10, int(math.ceil(cache_age_days)) + 7))
+                self.events.put((
+                    "log",
+                    f"Sıkıştırılmış günlük geçmiş bulundu; yalnızca son {refresh_days} günün "
+                    "günlük verisi güncelleniyor."
+                ))
+            else:
+                cached_bars = None
+                refresh_days = 365
+                self.events.put((
+                    "log",
+                    "Günlük geçmiş önbelleği yok, eski veya sembol evreni değişmiş; "
+                    "ilk tam geçmiş indiriliyor."
+                ))
             daily_result = self.broker.bars(
                 symbols,
                 progress_callback=lambda message: self.events.put(("log", message)),
-                stop_event=self.stop
+                stop_event=self.stop,
+                days=refresh_days
             )
             if self.stop.is_set() or daily_result.get("cancelled"):
                 self.events.put(("log", "Başlangıç veri indirmesi durdurma isteğiyle kesildi; emir gönderilmedi."))
                 return
-            daily_data = daily_result.get("bars", {})
+            updated_daily_data = daily_result.get("bars", {})
+            if cached_bars is not None:
+                daily_data = merge_daily_bar_cache(cached_bars, updated_daily_data, symbols)
+            else:
+                daily_data = merge_daily_bar_cache({}, updated_daily_data, symbols)
+            save_daily_bars_cache(symbols, daily_data)
             failed_daily_symbols = daily_result.get("failed_symbols", [])
             if failed_daily_symbols:
                 self.events.put(("log", f"Günlük verisi alınamayan {len(failed_daily_symbols)} sembol yeni alım adaylarından çıkarıldı."))
