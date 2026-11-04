@@ -290,10 +290,10 @@ class Alpaca:
             left_params = dict(params, symbols=",".join(left_symbols))
             right_params = dict(params, symbols=",".join(right_symbols))
             left_data, left_failed = self._fetch_bars_chunk(
-                left_symbols, left_params, max_pages, description, progress_callback
+                left_symbols, left_params, max_pages, description, progress_callback, stop_event
             )
             right_data, right_failed = self._fetch_bars_chunk(
-                right_symbols, right_params, max_pages, description, progress_callback
+                right_symbols, right_params, max_pages, description, progress_callback, stop_event
             )
             for symbol, rows in right_data.items():
                 left_data.setdefault(symbol, []).extend(rows)
@@ -353,11 +353,14 @@ class Alpaca:
                 "end": datetime.now(timezone.utc).isoformat(),
                 "sort": "asc"
             }
-            chunk_data, chunk_failed = self._fetch_bars_chunk(
-                chunk, params, max_pages=5,
-                description="Günlük hisse verisi", progress_callback=progress_callback,
-                stop_event=stop_event
-            )
+            try:
+                chunk_data, chunk_failed = self._fetch_bars_chunk(
+                    chunk, params, max_pages=5,
+                    description="Günlük hisse verisi", progress_callback=progress_callback,
+                    stop_event=stop_event
+                )
+            except DataRequestCancelled:
+                break
             for symbol, rows in chunk_data.items():
                 collected.setdefault(symbol, []).extend(rows)
             failed_symbols.update(chunk_failed)
@@ -1536,7 +1539,10 @@ class Bot:
             if not scan_symbols:
                 raise RuntimeError("20 milyon USD üzeri ortalama günlük dolar hacmine sahip yeterli aday bulunamadı.")
             del daily_data
-            spy_rows = self.broker.bars(["SPY"]).get("bars", {}).get("SPY", [])
+            spy_rows = self.broker.bars(["SPY"], stop_event=self.stop).get("bars", {}).get("SPY", [])
+            if self.stop.is_set():
+                self.events.put(("log", "SPY günlük verisi alınırken durdurma isteği geldi; emir gönderilmedi."))
+                return
             spy_completed, _, _ = prepare_daily_signal_rows(
                 spy_rows, bool(startup_clock.get("is_open")), market_day
             )
